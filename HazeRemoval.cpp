@@ -1,4 +1,5 @@
 #include "dehaze.h"
+#include "dehaze_common.h"
 #include "fastguidedfilter.h"
 #include <iostream>
 #include <chrono>
@@ -99,16 +100,17 @@ namespace DarkChannel {
             // Start timing for dark channel calculation
             auto darkChannelStartTime = std::chrono::high_resolution_clock::now();
 
-            // Get dark channel
-            int patch_radius = 7; // Consistent patch radius across all implementations
-            ImageF64 darkchannel = zeros<double>(img_double.width, img_double.height);
+            //------------------------------------------------------------------
+            // Step 1: Get dark channel using consistent parameters
+            //------------------------------------------------------------------
+            ImageF64 darkChannel = zeros<double>(img_double.width, img_double.height);
 
-            for (int i = 0; i < darkchannel.height; i++) {
-                for (int j = 0; j < darkchannel.width; j++) {
-                    int r_start = std::max(0, i - patch_radius);
-                    int r_end = std::min(darkchannel.height, i + patch_radius + 1);
-                    int c_start = std::max(0, j - patch_radius);
-                    int c_end = std::min(darkchannel.width, j + patch_radius + 1);
+            for (int i = 0; i < darkChannel.height; i++) {
+                for (int j = 0; j < darkChannel.width; j++) {
+                    int r_start = std::max(0, i - PATCH_RADIUS);
+                    int r_end = std::min(darkChannel.height, i + PATCH_RADIUS + 1);
+                    int c_start = std::max(0, j - PATCH_RADIUS);
+                    int c_end = std::min(darkChannel.width, j + PATCH_RADIUS + 1);
                     double dark = 1.0;  // Initialize to max normalized value (1.0)
 
                     for (int r = r_start; r < r_end; r++) {
@@ -123,7 +125,7 @@ namespace DarkChannel {
                         }
                     }
 
-                    darkchannel.at(i, j) = dark;
+                    darkChannel.at(i, j) = dark;
                 }
             }
 
@@ -135,17 +137,21 @@ namespace DarkChannel {
             // Start timing for atmospheric light estimation
             auto atmosphericStartTime = std::chrono::high_resolution_clock::now();
 
+            //------------------------------------------------------------------
+            // Step 2: Estimate atmospheric light using consistent algorithm
+            //------------------------------------------------------------------
+
             // Get atmospheric light
             int pixels = img_double.height * img_double.width;
             // Ensure at least 1 pixel is used
-            int num = std::max(1, pixels / 1000); // 0.1% brightest pixels
+            int numBrightestPixels = std::max(1, static_cast<int>(pixels * ATMOSPHERIC_LIGHT_PERCENTAGE));
             std::vector<std::pair<double, int>> V;
             V.reserve(pixels);
 
-            for (int i = 0; i < darkchannel.height; i++) {
-                for (int j = 0; j < darkchannel.width; j++) {
-                    int index = i * darkchannel.width + j;
-                    V.emplace_back(darkchannel.at(i, j), index);
+            for (int i = 0; i < darkChannel.height; i++) {
+                for (int j = 0; j < darkChannel.width; j++) {
+                    int index = i * darkChannel.width + j;
+                    V.emplace_back(darkChannel.at(i, j), index);
                 }
             }
 
@@ -157,26 +163,26 @@ namespace DarkChannel {
             double maxAtmospheric = 0.0;
 
             // First pass - find maximum intensity
-            for (int k = 0; k < num; k++) {
+            for (int k = 0; k < numBrightestPixels; k++) {
                 int idx = V[k].second;
-                int y = idx / darkchannel.width;
-                int x = idx % darkchannel.width;
+                int y = idx / darkChannel.width;
+                int x = idx % darkChannel.width;
 
                 double avgIntensity = (img_double.at(y, x, 0) + img_double.at(y, x, 1) + img_double.at(y, x, 2)) / 3.0;
-                if (avgIntensity > maxAtmospheric) {
-                    maxAtmospheric = avgIntensity;
-                }
+                maxAtmospheric = std::max(maxAtmospheric, avgIntensity);
             }
 
             // Second pass - use only reasonably bright pixels
             int validPixels = 0;
-            for (int k = 0; k < num; k++) {
+            for (int k = 0; k < numBrightestPixels; k++) {
                 int idx = V[k].second;
-                int y = idx / darkchannel.width;
-                int x = idx % darkchannel.width;
+                int y = idx / darkChannel.width;
+                int x = idx % darkChannel.width;
 
                 double avgIntensity = (img_double.at(y, x, 0) + img_double.at(y, x, 1) + img_double.at(y, x, 2)) / 3.0;
-                if (avgIntensity > maxAtmospheric * 0.7) { // Consistent threshold across implementations
+
+                // Only include pixels that are at least ATMOSPHERIC_LIGHT_THRESHOLD of max brightness
+                if (avgIntensity > maxAtmospheric * ATMOSPHERIC_LIGHT_THRESHOLD) {
                     atmospheric_light[0] += img_double.at(y, x, 0);
                     atmospheric_light[1] += img_double.at(y, x, 1);
                     atmospheric_light[2] += img_double.at(y, x, 2);
@@ -196,15 +202,15 @@ namespace DarkChannel {
                 atmospheric_light[2] = 0.8;
             }
 
-            // Use consistent bounds for atmospheric light values
+            // Apply consistent bounds for atmospheric light values
             for (int i = 0; i < 3; i++) {
-                atmospheric_light[i] = std::max(0.05, std::min(0.95, atmospheric_light[i]));
+                atmospheric_light[i] = std::max(ATMOSPHERIC_LIGHT_MIN, std::min(ATMOSPHERIC_LIGHT_MAX, atmospheric_light[i]));
             }
 
-            // Check if this is likely an indoor scene (consistent threshold)
+            // Check if this is likely an indoor scene - consistent detection logic
             bool isIndoorScene = false;
             double avgAtmospheric = (atmospheric_light[0] + atmospheric_light[1] + atmospheric_light[2]) / 3.0;
-            if (avgAtmospheric < 0.6) {
+            if (avgAtmospheric < INDOOR_THRESHOLD) {
                 isIndoorScene = true;
             }
 
@@ -216,8 +222,12 @@ namespace DarkChannel {
             // Start timing for transmission estimation
             auto transmissionStartTime = std::chrono::high_resolution_clock::now();
 
-            // Adjust omega for indoor/outdoor scenes
-            double omega = isIndoorScene ? 0.75 : 0.95; // Consistent omega values
+            //------------------------------------------------------------------
+            // Step 3: Calculate transmission map using consistent algorithm
+            //------------------------------------------------------------------
+
+            // Adjust omega based on scene type using consistent parameters
+            double omega = isIndoorScene ? OMEGA_INDOOR : OMEGA_OUTDOOR;
 
             ImageF64 channels[3];
             split(img_double, channels, 3);
@@ -238,10 +248,10 @@ namespace DarkChannel {
 
             for (int i = 0; i < temp.height; i++) {
                 for (int j = 0; j < temp.width; j++) {
-                    int r_start = std::max(0, i - patch_radius);
-                    int r_end = std::min(temp.height, i + patch_radius + 1);
-                    int c_start = std::max(0, j - patch_radius);
-                    int c_end = std::min(temp.width, j + patch_radius + 1);
+                    int r_start = std::max(0, i - PATCH_RADIUS);
+                    int r_end = std::min(temp.height, i + PATCH_RADIUS + 1);
+                    int c_start = std::max(0, j - PATCH_RADIUS);
+                    int c_end = std::min(temp.width, j + PATCH_RADIUS + 1);
                     double dark = 1.0;
 
                     for (int r = r_start; r < r_end; r++) {
@@ -260,7 +270,7 @@ namespace DarkChannel {
                 }
             }
 
-            // Get transmission
+            // Calculate transmission map
             ImageF64 transmission(temp_dark.width, temp_dark.height, 1);
 
             for (int i = 0; i < transmission.height; i++) {
@@ -277,8 +287,45 @@ namespace DarkChannel {
             // Start timing for refinement
             auto refinementStartTime = std::chrono::high_resolution_clock::now();
 
-            // Apply guided filter for refinement - use consistent parameters across implementations
-            transmission = fastGuidedFilter(img_double, transmission, 40, 0.1, 4);
+            //------------------------------------------------------------------
+            // Step 4: Refine transmission using guided filter with consistent parameters
+            //------------------------------------------------------------------
+
+            // Apply guided filter for refinement with consistent parameters
+            transmission = fastGuidedFilter(img_double, transmission,
+                GUIDED_FILTER_RADIUS,
+                GUIDED_FILTER_EPSILON,
+                GUIDED_FILTER_SUBSAMPLE);
+
+            // Apply sky region handling - consistent across all implementations
+            int skyRegionHeight = transmission.height / SKY_REGION_HEIGHT_RATIO;
+
+            for (int i = 0; i < skyRegionHeight; i++) {
+                for (int j = 0; j < transmission.width; j++) {
+                    // Get color info to detect sky
+                    double b = img_double.at(i, j, 0); // Blue
+                    double g = img_double.at(i, j, 1); // Green
+                    double r = img_double.at(i, j, 2); // Red
+
+                    // Sky detection using consistent criteria
+                    bool isSky = false;
+
+                    // Blue-dominant sky detection
+                    if (b > BLUE_THRESHOLD && b > r && b > g) {
+                        isSky = true;
+                    }
+
+                    // Bright sky detection (any color)
+                    if (b > BRIGHT_THRESHOLD && g > BRIGHT_THRESHOLD && r > BRIGHT_THRESHOLD) {
+                        isSky = true;
+                    }
+
+                    // Apply consistent transmission adjustment for sky
+                    if (isSky) {
+                        transmission.at(i, j) = std::max(transmission.at(i, j), SKY_TRANSMISSION_MIN);
+                    }
+                }
+            }
 
             // End timing for refinement
             auto refinementEndTime = std::chrono::high_resolution_clock::now();
@@ -288,36 +335,12 @@ namespace DarkChannel {
             // Start timing for scene reconstruction
             auto reconstructionStartTime = std::chrono::high_resolution_clock::now();
 
-            // Adjust minimum transmission value based on scene type (consistent across implementations)
-            double t0 = isIndoorScene ? 0.2 : 0.1;
+            //------------------------------------------------------------------
+            // Step 5: Reconstruct scene using consistent algorithm and color correction
+            //------------------------------------------------------------------
 
-            // Get a fresh copy of channels
-            split(img_double, channels, 3);
-
-            // Create bounded transmission map with better sky region handling
-            ImageF64 trans_bounded(transmission.width, transmission.height, 1);
-
-            for (int i = 0; i < transmission.height; i++) {
-                for (int j = 0; j < transmission.width; j++) {
-                    // Apply minimum transmission threshold
-                    trans_bounded.at(i, j) = std::max(transmission.at(i, j), t0);
-
-                    // Special handling for sky regions (typically in top portion of image)
-                    if (i < transmission.height / 3) {
-                        // Get color info to detect sky
-                        double b = img_double.at(i, j, 0); // Blue
-                        double g = img_double.at(i, j, 1); // Green
-                        double r = img_double.at(i, j, 2); // Red
-
-                        // Improved sky detection - consistent across implementations
-                        if ((b > 0.6 && b > r && b > g) ||      // Blue-dominant sky
-                            (b > 0.6 && g > 0.6 && r > 0.6)) {  // Bright sky (any color)
-                            // Use higher transmission for sky
-                            trans_bounded.at(i, j) = std::max(trans_bounded.at(i, j), 0.7);
-                        }
-                    }
-                }
-            }
+            // Use consistent transmission minimum threshold based on scene type
+            double t0 = isIndoorScene ? T0_INDOOR : T0_OUTDOOR;
 
             // Create result image
             ImageF64 result(img_double.width, img_double.height, img_double.channels);
@@ -325,39 +348,41 @@ namespace DarkChannel {
             // Recover the scene
             for (int i = 0; i < img_double.height; i++) {
                 for (int j = 0; j < img_double.width; j++) {
-                    double t = trans_bounded.at(i, j);
+                    // Apply minimum transmission threshold
+                    double t = std::max(transmission.at(i, j), t0);
 
-                    // Calculate temporary storage for color values
+                    // Temporary storage for color values
                     double recovered[3];
                     double lum = 0.0;
 
                     // Process each channel
                     for (int c = 0; c < 3; c++) {
                         double normalized = img_double.at(i, j, c);
-                        // Apply dehaze formula J = (I-A)/t + A with bounds checking
+                        // Apply dehaze formula J = (I-A)/t + A
                         recovered[c] = ((normalized - atmospheric_light[c]) / t) + atmospheric_light[c];
 
                         // Calculate luminance for saturation correction
-                        if (c == 0) lum += 0.114 * recovered[c];      // B
-                        else if (c == 1) lum += 0.587 * recovered[c]; // G
-                        else lum += 0.299 * recovered[c];             // R
+                        // Using standard RGB to grayscale weights
+                        if (c == 0) lum += LUMINANCE_B * recovered[c];      // B
+                        else if (c == 1) lum += LUMINANCE_G * recovered[c]; // G
+                        else lum += LUMINANCE_R * recovered[c];             // R
                     }
 
-                    // Apply consistent saturation/color correction across all implementations
+                    // Apply consistent saturation/color correction
                     for (int c = 0; c < 3; c++) {
-                        // Apply correction for extreme values to reduce artifacts
-                        if (recovered[c] > 0.8 || recovered[c] < 0.2) {
-                            recovered[c] = recovered[c] * 0.85 + lum * 0.15;
+                        // Correction for extreme values to reduce artifacts
+                        if (recovered[c] > EXTREME_VALUE_UPPER || recovered[c] < EXTREME_VALUE_LOWER) {
+                            recovered[c] = recovered[c] * COLOR_BLEND_FACTOR + lum * (1.0 - COLOR_BLEND_FACTOR);
                         }
 
-                        // Apply consistent brightness adjustments based on scene type
-                        if (lum < 0.5) {
-                            // For darker scenes (like indoor scenes), slightly increase brightness
-                            recovered[c] = pow(recovered[c], 0.9);
+                        // Apply brightness adjustments based on luminance
+                        if (lum < DARK_SCENE_THRESHOLD) {
+                            // For darker scenes, slightly increase brightness
+                            recovered[c] = std::pow(recovered[c], DARK_SCENE_GAMMA);
                         }
                         else {
-                            // For brighter scenes, keep as is or slightly reduce brightness
-                            recovered[c] = pow(recovered[c], 1.05);
+                            // For brighter scenes, slightly reduce brightness
+                            recovered[c] = std::pow(recovered[c], BRIGHT_SCENE_GAMMA);
                         }
 
                         // Ensure bounds and store

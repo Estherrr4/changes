@@ -8,6 +8,7 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include "dehaze_common.h"
 
 // Define CUDA_ENABLED for isCudaAvailable() function
 #define CUDA_ENABLED
@@ -79,8 +80,8 @@ extern "C" void launchCudaPart() {
 //Check CUDA Part End
 
 // Optimized constant memory for performance - using double for matching precision
-__constant__ double c_eps = 0.1;
-__constant__ int c_window_radius = 8; // For box filter
+__constant__ double c_eps = GUIDED_FILTER_EPSILON;
+__constant__ int c_window_radius = GUIDED_FILTER_RADIUS; // For box filter
 
 // Improved dark channel kernel with shared memory optimization - using double precision
 __global__ void darkChannelKernel(const unsigned char* imgData, double* darkChannel,
@@ -93,6 +94,9 @@ __global__ void darkChannelKernel(const unsigned char* imgData, double* darkChan
     // Local thread indices
     int tx = threadIdx.x;
     int ty = threadIdx.y;
+
+    // Use consistent patch radius from common header
+    patch_radius = PATCH_RADIUS;  // Ensure this matches CPU versions
 
     // Shared memory block size with halo cells
     int block_width = blockDim.x + 2 * patch_radius;
@@ -184,6 +188,9 @@ __global__ void transmissionKernel(const unsigned char* imgData, const double* a
 
     if (x >= width || y >= height) return;
 
+    // Use the consistent patch radius
+    patch_radius = PATCH_RADIUS;
+
     double minVal = 1.0;
     int idx = y * width + x;
 
@@ -207,7 +214,7 @@ __global__ void transmissionKernel(const unsigned char* imgData, const double* a
         }
     }
 
-    // Calculate transmission
+    // Calculate transmission with consistent omega
     transmission[idx] = 1.0 - omega * minVal;
 }
 
@@ -310,19 +317,26 @@ __global__ void skyRegionHandlingKernel(double* transmission, const unsigned cha
     if (x >= width || y >= height) return;
 
     // Only process top third of image (matching serial/OpenMP implementation)
-    if (y < height / 3) {
+    int skyHeight = height / SKY_REGION_HEIGHT_RATIO;
+    if (y < skyHeight) {
         int rgbIdx = (y * width + x) * channels;
         double b = imgData[rgbIdx] / 255.0;       // Blue value
         double g = imgData[rgbIdx + 1] / 255.0;   // Green value
         double r = imgData[rgbIdx + 2] / 255.0;   // Red value
 
         // Match the same sky detection criteria as in serial/OpenMP implementation
-        if ((b > 0.6 && b > r && b > g) || // Blue-dominant sky
-            (b > 0.6 && g > 0.6 && r > 0.6)) { // Bright sky (any color)
+        bool isSky = false;
+        if (b > BLUE_THRESHOLD && b > r && b > g) {          // Blue-dominant sky
+            isSky = true;
+        }
+        if (b > BRIGHT_THRESHOLD && g > BRIGHT_THRESHOLD && r > BRIGHT_THRESHOLD) {  // Bright sky (any color)
+            isSky = true;
+        }
 
+        if (isSky) {
             int idx = y * width + x;
             // Use same transmission value threshold as serial/OpenMP implementation
-            transmission[idx] = fmax(transmission[idx], 0.7);
+            transmission[idx] = fmax(transmission[idx], SKY_TRANSMISSION_MIN);
         }
     }
 }
@@ -339,10 +353,10 @@ __global__ void sceneRecoveryKernel(const unsigned char* imgData, const double* 
     int idx = (y * width + x) * channels;
     int tidx = y * width + x;
 
-    // Higher minimum transmission to preserve detail in dark areas
+    // Apply minimum transmission threshold
     double t = fmax(transmission[tidx], t0);
 
-    // Create temporary storage for color values to ensure consistent processing
+    // Calculate temporary storage for color values
     double recovered[3];
     double lum = 0.0;
 
@@ -351,28 +365,28 @@ __global__ void sceneRecoveryKernel(const unsigned char* imgData, const double* 
         double normalized = imgData[idx + c] / 255.0;
         // Apply dehaze formula J = (I-A)/t + A with bounds checking
         recovered[c] = ((normalized - atmospheric[c]) / t) + atmospheric[c];
-        // Calculate lum for saturation correction (assuming BGR order)
-        if (c == 0) lum += 0.114 * recovered[c]; // B
-        else if (c == 1) lum += 0.587 * recovered[c]; // G
-        else lum += 0.299 * recovered[c]; // R
+
+        // Calculate lum for saturation correction using standard weights
+        if (c == 0) lum += LUMINANCE_B * recovered[c]; // B
+        else if (c == 1) lum += LUMINANCE_G * recovered[c]; // G
+        else lum += LUMINANCE_R * recovered[c]; // R
     }
 
-    // Now apply mild saturation correction and convert to 8-bit
+    // Apply color correction - MATCH SERIAL/OPENMP IMPLEMENTATION EXACTLY
     for (int c = 0; c < channels; c++) {
         // Apply correction for extreme values to reduce artifacts
-        if (recovered[c] > 0.8 || recovered[c] < 0.2) {
-            recovered[c] = recovered[c] * 0.85 + lum * 0.15;
+        if (recovered[c] > EXTREME_VALUE_UPPER || recovered[c] < EXTREME_VALUE_LOWER) {
+            recovered[c] = recovered[c] * COLOR_BLEND_FACTOR + lum * (1.0 - COLOR_BLEND_FACTOR);
         }
 
-        // BRIGHTNESS ADJUSTMENT: Match the brightness level with serial implementation
         // Apply consistent brightness adjustments based on scene type
-        if (lum < 0.5) {
-            // For darker scenes (like indoor scenes), slightly increase brightness
-            recovered[c] = pow(recovered[c], 0.9);
+        if (lum < DARK_SCENE_THRESHOLD) {
+            // For darker scenes, slightly increase brightness
+            recovered[c] = pow(recovered[c], DARK_SCENE_GAMMA);
         }
         else {
-            // For brighter scenes, keep as is or slightly reduce brightness
-            recovered[c] = pow(recovered[c], 1.05);
+            // For brighter scenes, slightly reduce brightness
+            recovered[c] = pow(recovered[c], BRIGHT_SCENE_GAMMA);
         }
 
         // Ensure bounds and convert to 8-bit
@@ -515,6 +529,7 @@ namespace DarkChannel {
         }
     }
 
+    // Complete implementation of the dehaze_cuda function
     ImageU8 dehaze_cuda(const ImageU8& img) {
         try {
             // Reset timing info
@@ -573,7 +588,7 @@ namespace DarkChannel {
                     (height + blockSize.y - 1) / blockSize.y);
 
                 // Calculate shared memory size for the dark channel kernel
-                int patchRadius = 7;
+                int patchRadius = PATCH_RADIUS;
                 int sharedWidth = blockSize.x + 2 * patchRadius;
                 int sharedHeight = blockSize.y + 2 * patchRadius;
                 size_t sharedMemSize = sharedWidth * sharedHeight * channels * sizeof(unsigned char);
@@ -596,7 +611,9 @@ namespace DarkChannel {
                 // Start atmospheric light estimation timing
                 auto atmosphericStartTime = std::chrono::high_resolution_clock::now();
 
-                // Find atmospheric light (top 0.1% brightest pixels in dark channel)
+                // Find atmospheric light using same algorithm as CPU versions
+                // Select top 0.1% brightest pixels in dark channel
+                int numBrightestPixels = std::max(1, static_cast<int>(imgSize * ATMOSPHERIC_LIGHT_PERCENTAGE));
                 std::vector<std::pair<double, int>> brightnessIndices;
                 brightnessIndices.reserve(imgSize);
 
@@ -609,64 +626,58 @@ namespace DarkChannel {
                         return a.first > b.first;
                     });
 
-                // Use top 0.1% brightest pixels but with protection for extreme values
-                int numBrightestPixels = std::max(1, imgSize / 1000);
+                // Find maximum intensity among top pixels
                 double atmospheric[3] = { 0, 0, 0 };
                 double maxAtmospheric = 0.0;
-                bool validAtmospheric = false;
 
-                // First pass - find the maximum value
                 for (int i = 0; i < numBrightestPixels; i++) {
                     int idx = brightnessIndices[i].second;
                     int y = idx / width;
                     int x = idx % width;
 
-                    double avgIntensity = (img.at(y, x, 0) + img.at(y, x, 1) + img.at(y, x, 2)) / 3.0;
-
-                    if (avgIntensity > maxAtmospheric) {
-                        maxAtmospheric = avgIntensity;
-                    }
+                    double avgIntensity = (img.at(y, x, 0) + img.at(y, x, 1) + img.at(y, x, 2)) / (3.0 * 255.0);
+                    maxAtmospheric = std::max(maxAtmospheric, avgIntensity);
                 }
 
-                // Now use pixels that are not too far from the max
+                // Use only pixels that are at least ATMOSPHERIC_LIGHT_THRESHOLD of max brightness
+                int validPixels = 0;
                 for (int i = 0; i < numBrightestPixels; i++) {
                     int idx = brightnessIndices[i].second;
                     int y = idx / width;
                     int x = idx % width;
 
-                    double avgIntensity = (img.at(y, x, 0) + img.at(y, x, 1) + img.at(y, x, 2)) / 3.0;
+                    double avgIntensity = (img.at(y, x, 0) + img.at(y, x, 1) + img.at(y, x, 2)) / (3.0 * 255.0);
 
-                    // Only use pixels that are reasonably bright
-                    if (avgIntensity > maxAtmospheric * 0.7) {
+                    if (avgIntensity > maxAtmospheric * ATMOSPHERIC_LIGHT_THRESHOLD) {
                         atmospheric[0] += img.at(y, x, 0) / 255.0;  // B
                         atmospheric[1] += img.at(y, x, 1) / 255.0;  // G
                         atmospheric[2] += img.at(y, x, 2) / 255.0;  // R
-                        validAtmospheric = true;
+                        validPixels++;
                     }
                 }
 
-                // Normalize if we found valid pixels
-                if (validAtmospheric) {
-                    atmospheric[0] /= numBrightestPixels;
-                    atmospheric[1] /= numBrightestPixels;
-                    atmospheric[2] /= numBrightestPixels;
+                // Normalize atmospheric light
+                if (validPixels > 0) {
+                    atmospheric[0] /= validPixels;
+                    atmospheric[1] /= validPixels;
+                    atmospheric[2] /= validPixels;
                 }
                 else {
-                    // Use a fallback if no good atmospheric light found
+                    // Fallback - same as CPU versions
                     atmospheric[0] = 0.8;
                     atmospheric[1] = 0.8;
                     atmospheric[2] = 0.8;
                 }
 
-                // Use exactly the same bounds in both serial and CUDA
+                // Apply consistent bounds
                 for (int i = 0; i < 3; i++) {
-                    atmospheric[i] = std::max(0.05, std::min(0.95, atmospheric[i]));
+                    atmospheric[i] = std::max(ATMOSPHERIC_LIGHT_MIN, std::min(ATMOSPHERIC_LIGHT_MAX, atmospheric[i]));
                 }
 
-                // Check if this is likely an indoor scene based on atmospheric light
+                // Check if this is likely an indoor scene using same threshold as CPU
                 bool isIndoorScene = false;
                 double avgAtmospheric = (atmospheric[0] + atmospheric[1] + atmospheric[2]) / 3.0;
-                if (avgAtmospheric < 0.6) {
+                if (avgAtmospheric < INDOOR_THRESHOLD) {
                     isIndoorScene = true;
                 }
 
@@ -686,8 +697,8 @@ namespace DarkChannel {
                 checkCudaErrors(cudaMemcpy(d_atmospheric, atmospheric,
                     3 * sizeof(double), cudaMemcpyHostToDevice));
 
-                // Adjust omega for indoor scenes - same as serial
-                double omega = isIndoorScene ? 0.75 : 0.95;
+                // Adjust omega based on scene type - same as CPU versions
+                double omega = isIndoorScene ? OMEGA_INDOOR : OMEGA_OUTDOOR;
 
                 // Estimate transmission using dark channel prior
                 transmissionKernel << <gridSize, blockSize >> > (
@@ -705,9 +716,14 @@ namespace DarkChannel {
                 // Allocate memory for refined transmission
                 checkCudaErrors(cudaMalloc(&d_refined_transmission, imgSize * sizeof(double)));
 
-                // Apply guided filter refinement using double precision implementation
-                // Use the same parameters as serial implementation (radius 40, epsilon 0.1, subsample factor 4)
-                guidedFilterCuda(d_img, d_transmission, d_refined_transmission, width, height, channels, 40, 0.1);
+                // Apply guided filter refinement using same parameters as CPU
+                guidedFilterCuda(d_img, d_transmission, d_refined_transmission, width, height, channels,
+                    GUIDED_FILTER_RADIUS, GUIDED_FILTER_EPSILON);
+
+                // Apply sky region handling - same as CPU versions
+                skyRegionHandlingKernel << <gridSize, blockSize >> > (
+                    d_refined_transmission, d_img, width, height, channels);
+                checkKernelErrors();
 
                 // End refinement timing
                 auto refinementEndTime = std::chrono::high_resolution_clock::now();
@@ -720,8 +736,8 @@ namespace DarkChannel {
                 // Allocate memory for result
                 checkCudaErrors(cudaMalloc(&d_result, imgBytes));
 
-                // Adjust minimum transmission value for indoor scenes - same as serial
-                double t0 = isIndoorScene ? 0.2 : 0.1;
+                // Use consistent minimum transmission threshold
+                double t0 = isIndoorScene ? T0_INDOOR : T0_OUTDOOR;
 
                 // Recover scene with enhanced quality and adaptive parameters
                 sceneRecoveryKernel << <gridSize, blockSize >> > (
