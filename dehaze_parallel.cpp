@@ -1,20 +1,17 @@
-#include "dehaze_parallel.h"
-#include "fastguidedfilter.h"
-#include "dehaze.h"
-#include <iostream>
-#include <chrono>
-#include <algorithm>
-#include <vector>
-#include <omp.h>
+//#include "dehaze_parallel.h"
+//#include "fastguidedfilter.h"
+//#include "dehaze.h"
+//#include <iostream>
+//#include <chrono>
+//#include <algorithm>
+//#include <vector>
+//#include <omp.h>
+//#include <iomanip>
 
-#ifdef CUDA_ENABLED
-#include <cuda_runtime.h>
-#endif
-
-namespace DarkChannel {
+/*namespace DarkChannel {
     extern TimingInfo lastTimingInfo;
 
-    cv::Mat dehazeParallel(const cv::Mat& img, int numThreads) {
+    ImageU8 dehazeParallel(const ImageU8& img, int numThreads) {
         try {
             // Reset timing info
             TimingInfo timingInfo;
@@ -34,42 +31,44 @@ namespace DarkChannel {
             }
 
             // Check for correct image type
-            if (img.type() != CV_8UC3) {
+            if (img.channels != 3) {
                 std::cerr << "Error: Only 3-channel images are supported" << std::endl;
                 return img;
             }
 
-            cv::Mat img_double;
-            img.convertTo(img_double, CV_64FC3);
-            img_double /= 255;
+            // Convert to double precision for calculations
+            ImageF64 img_double = img.convertTo<double>(1.0 / 255.0);
 
             // Start timing for dark channel calculation
             auto darkChannelStartTime = std::chrono::high_resolution_clock::now();
 
             // Get dark channel
             int patch_radius = 7;
-            cv::Mat darkchannel = cv::Mat::zeros(img_double.rows, img_double.cols, CV_64F);
+            ImageF64 darkchannel = zeros<double>(img_double.width, img_double.height);
 
             // Use OpenMP for parallelism
-            #pragma omp parallel for schedule(dynamic)
-            for (int i = 0; i < darkchannel.rows; i++) {
-                for (int j = 0; j < darkchannel.cols; j++) {
+#pragma omp parallel for schedule(dynamic)
+            for (int i = 0; i < darkchannel.height; i++) {
+                for (int j = 0; j < darkchannel.width; j++) {
                     int r_start = std::max(0, i - patch_radius);
-                    int r_end = std::min(darkchannel.rows, i + patch_radius + 1);
+                    int r_end = std::min(darkchannel.height, i + patch_radius + 1);
                     int c_start = std::max(0, j - patch_radius);
-                    int c_end = std::min(darkchannel.cols, j + patch_radius + 1);
+                    int c_end = std::min(darkchannel.width, j + patch_radius + 1);
                     double dark = 1.0; // Start with maximum value (after normalization)
 
                     for (int r = r_start; r < r_end; r++) {
                         for (int c = c_start; c < c_end; c++) {
-                            const cv::Vec3d& val = img_double.at<cv::Vec3d>(r, c);
-                            dark = std::min(dark, val[0]);
-                            dark = std::min(dark, val[1]);
-                            dark = std::min(dark, val[2]);
+                            double val0 = img_double.at(r, c, 0);
+                            double val1 = img_double.at(r, c, 1);
+                            double val2 = img_double.at(r, c, 2);
+
+                            dark = std::min(dark, val0);
+                            dark = std::min(dark, val1);
+                            dark = std::min(dark, val2);
                         }
                     }
 
-                    darkchannel.at<double>(i, j) = dark;
+                    darkchannel.at(i, j) = dark;
                 }
             }
 
@@ -81,17 +80,17 @@ namespace DarkChannel {
             auto atmosphericStartTime = std::chrono::high_resolution_clock::now();
 
             // Get atmospheric light
-            int pixels = img_double.rows * img_double.cols;
+            int pixels = img_double.height * img_double.width;
             // Ensure at least 1 pixel is used
             int num = std::max(1, pixels / 1000); // 0.1%
             std::vector<std::pair<double, int>> V;
             V.reserve(pixels);
 
             // Create flat index for each pixel with its dark channel value
-            for (int i = 0; i < darkchannel.rows; i++) {
-                for (int j = 0; j < darkchannel.cols; j++) {
-                    int index = i * darkchannel.cols + j;
-                    V.emplace_back(darkchannel.at<double>(i, j), index);
+            for (int i = 0; i < darkchannel.height; i++) {
+                for (int j = 0; j < darkchannel.width; j++) {
+                    int index = i * darkchannel.width + j;
+                    V.emplace_back(darkchannel.at(i, j), index);
                 }
             }
 
@@ -101,18 +100,17 @@ namespace DarkChannel {
                 });
 
             // Initialize atmospheric light array
-            double atmospheric_light[] = { 0, 0, 0 };
+            double atmospheric_light[3] = { 0, 0, 0 };
 
             // Calculate atmospheric light from brightest pixels
             for (int k = 0; k < num; k++) {
                 int idx = V[k].second;
-                int r = idx / darkchannel.cols;
-                int c = idx % darkchannel.cols;
-                const cv::Vec3d& val = img_double.at<cv::Vec3d>(r, c);
+                int r = idx / darkchannel.width;
+                int c = idx % darkchannel.width;
 
-                atmospheric_light[0] += val[0];
-                atmospheric_light[1] += val[1];
-                atmospheric_light[2] += val[2];
+                atmospheric_light[0] += img_double.at(r, c, 0);
+                atmospheric_light[1] += img_double.at(r, c, 1);
+                atmospheric_light[2] += img_double.at(r, c, 2);
             }
 
             atmospheric_light[0] /= num;
@@ -134,45 +132,60 @@ namespace DarkChannel {
             auto transmissionStartTime = std::chrono::high_resolution_clock::now();
 
             double omega = 0.95;
-            cv::Mat channels[3];
-            cv::split(img_double, channels);
+            ImageF64 channels[3];
+            split(img_double, channels, 3);
 
             // Normalize each channel by atmospheric light
+#pragma omp parallel for
             for (int k = 0; k < 3; k++) {
-                channels[k] /= atmospheric_light[k];
+                for (int i = 0; i < channels[k].height; i++) {
+                    for (int j = 0; j < channels[k].width; j++) {
+                        channels[k].at(i, j) /= atmospheric_light[k];
+                    }
+                }
             }
 
             // Merge normalized channels
-            cv::Mat temp;
-            cv::merge(channels, 3, temp);
+            ImageF64 temp;
+            merge(channels, 3, temp);
 
             // Get dark channel of normalized image
-            cv::Mat temp_dark = cv::Mat::zeros(temp.rows, temp.cols, CV_64F);
+            ImageF64 temp_dark = zeros<double>(temp.width, temp.height);
 
-            #pragma omp parallel for schedule(dynamic)
-            for (int i = 0; i < temp.rows; i++) {
-                for (int j = 0; j < temp.cols; j++) {
+#pragma omp parallel for schedule(dynamic)
+            for (int i = 0; i < temp.height; i++) {
+                for (int j = 0; j < temp.width; j++) {
                     int r_start = std::max(0, i - patch_radius);
-                    int r_end = std::min(temp.rows, i + patch_radius + 1);
+                    int r_end = std::min(temp.height, i + patch_radius + 1);
                     int c_start = std::max(0, j - patch_radius);
-                    int c_end = std::min(temp.cols, j + patch_radius + 1);
+                    int c_end = std::min(temp.width, j + patch_radius + 1);
                     double dark = 1.0;
 
                     for (int r = r_start; r < r_end; r++) {
                         for (int c = c_start; c < c_end; c++) {
-                            const cv::Vec3d& val = temp.at<cv::Vec3d>(r, c);
-                            dark = std::min(dark, val[0]);
-                            dark = std::min(dark, val[1]);
-                            dark = std::min(dark, val[2]);
+                            double val0 = temp.at(r, c, 0);
+                            double val1 = temp.at(r, c, 1);
+                            double val2 = temp.at(r, c, 2);
+
+                            dark = std::min(dark, val0);
+                            dark = std::min(dark, val1);
+                            dark = std::min(dark, val2);
                         }
                     }
 
-                    temp_dark.at<double>(i, j) = dark;
+                    temp_dark.at(i, j) = dark;
                 }
             }
 
             // Get transmission
-            cv::Mat transmission = 1.0 - omega * temp_dark;
+            ImageF64 transmission(temp_dark.width, temp_dark.height, 1);
+
+#pragma omp parallel for collapse(2)
+            for (int i = 0; i < transmission.height; i++) {
+                for (int j = 0; j < transmission.width; j++) {
+                    transmission.at(i, j) = 1.0 - omega * temp_dark.at(i, j);
+                }
+            }
 
             // End timing for transmission estimation
             auto transmissionEndTime = std::chrono::high_resolution_clock::now();
@@ -193,39 +206,40 @@ namespace DarkChannel {
 
             // Ensure minimum transmission value to preserve details in dark regions
             double t0 = 0.1;
-            cv::Mat trans_bounded;
-            cv::max(transmission, t0, trans_bounded);
 
             // Get a fresh copy of the image channels
-            cv::split(img_double, channels);
+            split(img_double, channels, 3);
+
+            // Apply minimum transmission
+            ImageF64 trans_bounded(transmission.width, transmission.height, 1);
+
+#pragma omp parallel for collapse(2)
+            for (int i = 0; i < trans_bounded.height; i++) {
+                for (int j = 0; j < trans_bounded.width; j++) {
+                    trans_bounded.at(i, j) = std::max(transmission.at(i, j), t0);
+                }
+            }
 
             // Create result image
-            cv::Mat result(img_double.size(), CV_64FC3);
-            cv::Vec3d* result_data = (cv::Vec3d*)result.data;
+            ImageF64 result(img_double.width, img_double.height, img_double.channels);
 
-            // Process all pixels in a more straightforward way
-            #pragma omp parallel for
-            for (int i = 0; i < img_double.rows; i++) {
-                for (int j = 0; j < img_double.cols; j++) {
-                    const int idx = i * img_double.cols + j;
-                    const double t = trans_bounded.at<double>(i, j);
-                    const cv::Vec3d& pixel = img_double.at<cv::Vec3d>(i, j);
+            // Process all pixels in parallel
+#pragma omp parallel for collapse(2)
+            for (int i = 0; i < img_double.height; i++) {
+                for (int j = 0; j < img_double.width; j++) {
+                    const double t = trans_bounded.at(i, j);
 
                     // Apply dehaze formula to each channel: J = (I-A)/t + A
-                    cv::Vec3d dehazed;
                     for (int c = 0; c < 3; c++) {
-                        dehazed[c] = ((pixel[c] - atmospheric_light[c]) / t) + atmospheric_light[c];
+                        double dehazed = ((channels[c].at(i, j) - atmospheric_light[c]) / t) + atmospheric_light[c];
                         // Clamp to valid range
-                        dehazed[c] = std::max(0.0, std::min(1.0, dehazed[c]));
+                        result.at(i, j, c) = std::max(0.0, std::min(1.0, dehazed));
                     }
-
-                    result_data[idx] = dehazed;
                 }
             }
 
             // Convert back to 8-bit
-            cv::Mat result_8bit;
-            result.convertTo(result_8bit, CV_8UC3, 255.0);
+            ImageU8 result_8bit = result.convertTo<unsigned char>(255.0);
 
             // End timing for scene reconstruction
             auto reconstructionEndTime = std::chrono::high_resolution_clock::now();
@@ -248,12 +262,8 @@ namespace DarkChannel {
 
             return result_8bit;
         }
-        catch (const cv::Exception& e) {
-            std::cerr << "OpenCV Exception in OpenMP implementation: " << e.what() << std::endl;
-            return img;
-        }
         catch (const std::exception& e) {
-            std::cerr << "Standard Exception in OpenMP implementation: " << e.what() << std::endl;
+            std::cerr << "Exception in OpenMP implementation: " << e.what() << std::endl;
             return img;
         }
         catch (...) {
@@ -261,6 +271,4 @@ namespace DarkChannel {
             return img;
         }
     }
-
-    bool isCudaAvailable();
-}
+}*/

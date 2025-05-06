@@ -2,7 +2,7 @@
 #ifndef GUIDED_FILTER_H
 #define GUIDED_FILTER_H
 
-#include <opencv2/opencv.hpp>
+#include "custom_types.h"
 
 // Forward declaration
 class FastGuidedFilterImpl;
@@ -10,16 +10,16 @@ class FastGuidedFilterImpl;
 class FastGuidedFilter
 {
 public:
-    FastGuidedFilter(const cv::Mat& I, int r, double eps, int s);
+    FastGuidedFilter(const ImageF64& I, int r, double eps, int s);
     ~FastGuidedFilter();
 
-    cv::Mat filter(const cv::Mat& p, int depth = -1) const;
+    ImageF64 filter(const ImageF64& p, int depth = -1) const;
 
 private:
     FastGuidedFilterImpl* impl_;
 };
 
 // Function declaration only
-cv::Mat fastGuidedFilter(const cv::Mat& I, const cv::Mat& p, int r, double eps, int s = 1, int depth = -1);
+ImageF64 fastGuidedFilter(const ImageF64& I, const ImageF64& p, int r, double eps, int s = 1, int depth = -1);
 
 #endif // GUIDED_FILTER_H

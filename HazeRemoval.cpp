@@ -1,7 +1,11 @@
 #include "dehaze.h"
 #include "fastguidedfilter.h"
 #include <iostream>
-#include <chrono>  // For timing measurements
+#include <chrono>
+#include <algorithm>
+#include <vector>
+#include <iomanip>
+#include <cmath>
 
 namespace DarkChannel {
     // Global timing info that can be accessed from outside
@@ -45,7 +49,7 @@ namespace DarkChannel {
                     int r_end = std::min(darkchannel.rows, i + patch_radius + 1);
                     int c_start = std::max(0, j - patch_radius);
                     int c_end = std::min(darkchannel.cols, j + patch_radius + 1);
-                    double dark = 255;
+                    double dark = 1.0;  // Initialize to max normalized value (1.0)
                     for (int r = r_start; r < r_end; r++) {
                         for (int c = c_start; c < c_end; c++) {
                             const cv::Vec3d& val = img_double.at<cv::Vec3d>(r, c);
@@ -68,9 +72,10 @@ namespace DarkChannel {
             // Get atmospheric light
             int pixels = img_double.rows * img_double.cols;
             // Ensure at least 1 pixel is used
-            int num = std::max(1, pixels / 1000); // 0.1%
+            int num = std::max(1, pixels / 1000); // 0.1% brightest pixels
             std::vector<std::pair<double, int>> V;
             V.reserve(pixels);
+
             int k = 0;
             for (int i = 0; i < darkchannel.rows; i++) {
                 for (int j = 0; j < darkchannel.cols; j++) {
@@ -83,25 +88,57 @@ namespace DarkChannel {
                 return p1.first > p2.first;
                 });
 
-            double atmospheric_light[] = { 0, 0, 0 };
+            double atmospheric_light[3] = { 0, 0, 0 };
+            double maxAtmospheric = 0.0;
             for (k = 0; k < num; k++) {
                 int r = V[k].second / darkchannel.cols;
                 int c = V[k].second % darkchannel.cols;
                 const cv::Vec3d& val = img_double.at<cv::Vec3d>(r, c);
-                atmospheric_light[0] += val[0];
-                atmospheric_light[1] += val[1];
-                atmospheric_light[2] += val[2];
+
+                double avgIntensity = (val[0] + val[1] + val[2]) / 3.0;
+                if (avgIntensity > maxAtmospheric) {
+                    maxAtmospheric = avgIntensity;
+                }
             }
 
-            atmospheric_light[0] /= num;
-            atmospheric_light[1] /= num;
-            atmospheric_light[2] /= num;
+            // Second pass - use only reasonably bright pixels
+            int validPixels = 0;
+            for (k = 0; k < num; k++) {
+                int r = V[k].second / darkchannel.cols;
+                int c = V[k].second % darkchannel.cols;
+                const cv::Vec3d& val = img_double.at<cv::Vec3d>(r, c);
 
-            // Avoid division by zero
-            for (int i = 0; i < 3; i++) {
-                if (atmospheric_light[i] < 0.00001) {
-                    atmospheric_light[i] = 0.00001;
+                double avgIntensity = (val[0] + val[1] + val[2]) / 3.0;
+                if (avgIntensity > maxAtmospheric * 0.7) {
+                    atmospheric_light[0] += val[0];
+                    atmospheric_light[1] += val[1];
+                    atmospheric_light[2] += val[2];
+                    validPixels++;
                 }
+            }
+
+            if (validPixels > 0) {
+                atmospheric_light[0] /= validPixels;
+                atmospheric_light[1] /= validPixels;
+                atmospheric_light[2] /= validPixels;
+            }
+            else {
+                // Fallback if no good pixels found
+                atmospheric_light[0] = 0.8;
+                atmospheric_light[1] = 0.8;
+                atmospheric_light[2] = 0.8;
+            }
+
+            // Use consistent bounds for atmospheric light values
+            for (int i = 0; i < 3; i++) {
+                atmospheric_light[i] = std::max(0.05, std::min(0.95, atmospheric_light[i]));
+            }
+
+            // Check if this is likely an indoor scene
+            bool isIndoorScene = false;
+            double avgAtmospheric = (atmospheric_light[0] + atmospheric_light[1] + atmospheric_light[2]) / 3.0;
+            if (avgAtmospheric < 0.6) {
+                isIndoorScene = true;
             }
 
             // End timing for atmospheric light estimation
@@ -111,7 +148,8 @@ namespace DarkChannel {
             // Start timing for transmission estimation
             auto transmissionStartTime = std::chrono::high_resolution_clock::now();
 
-            double omega = 0.95;
+            // Adjust omega for indoor/outdoor scenes
+            double omega = isIndoorScene ? 0.75 : 0.95;
             cv::Mat channels[3];
             cv::split(img_double, channels);
             for (k = 0; k < 3; k++) {
@@ -129,7 +167,7 @@ namespace DarkChannel {
                     int r_end = std::min(temp.rows, i + patch_radius + 1);
                     int c_start = std::max(0, j - patch_radius);
                     int c_end = std::min(temp.cols, j + patch_radius + 1);
-                    double dark = 255;
+                    double dark = 1.0;
                     for (int r = r_start; r < r_end; r++) {
                         for (int c = c_start; c < c_end; c++) {
                             const cv::Vec3d& val = temp.at<cv::Vec3d>(r, c);
@@ -143,7 +181,7 @@ namespace DarkChannel {
             }
 
             // Get transmission
-            cv::Mat transmission = 1 - omega * temp_dark;
+            cv::Mat transmission = 1.0 - omega * temp_dark;
 
             // End timing for transmission estimation
             auto transmissionEndTime = std::chrono::high_resolution_clock::now();
@@ -152,8 +190,8 @@ namespace DarkChannel {
             // Start timing for refinement
             auto refinementStartTime = std::chrono::high_resolution_clock::now();
 
-            // Apply guided filter for refinement
-            transmission = fastGuidedFilter(img_double, transmission, 40, 0.1, 5);
+            // Apply guided filter for refinement - use consistent parameters
+            transmission = fastGuidedFilter(img_double, transmission, 40, 0.1, 4);
 
             // End timing for refinement
             auto refinementEndTime = std::chrono::high_resolution_clock::now();
@@ -162,30 +200,109 @@ namespace DarkChannel {
             // Start timing for scene reconstruction
             auto reconstructionStartTime = std::chrono::high_resolution_clock::now();
 
-            // Ensure minimum transmission value to preserve details in dark regions
-            double t0 = 0.1;
+            // Adjust minimum transmission value based on scene type
+            double t0 = isIndoorScene ? 0.2 : 0.1;
+
+            // Get a fresh copy of channels
             cv::split(img_double, channels);
-            cv::Mat trans_;
-            cv::max(transmission, t0, trans_);
 
-            cv::Mat temp_;
-            for (k = 0; k < 3; k++) {
-                cv::divide((channels[k] - atmospheric_light[k]), trans_, temp_);
-                channels[k] = atmospheric_light[k] + temp_;
+            // Create bounded transmission map with better sky region handling
+            cv::Mat trans_ = cv::Mat(transmission.size(), CV_64F);
+            for (int i = 0; i < transmission.rows; i++) {
+                for (int j = 0; j < transmission.cols; j++) {
+                    // Apply minimum transmission threshold
+                    trans_.at<double>(i, j) = std::max(transmission.at<double>(i, j), t0);
+
+                    // Special handling for sky regions (typically in top portion of image)
+                    if (i < transmission.rows / 2) {
+                        // Get color info to detect sky
+                        const cv::Vec3d& val = img_double.at<cv::Vec3d>(i, j);
+                        double b = val[0]; // Blue
+                        double g = val[1]; // Green
+                        double r = val[2]; // Red
+
+                        // Improved sky detection
+                        if (b > 0.5 || (b > 0.4 && g > 0.4 && r > 0.4)) {
+                            // Use higher transmission for sky
+                            trans_.at<double>(i, j) = 0.95;
+
+                            // Special handling for horizon/upper sky
+                            if (i < transmission.rows / 6) {
+                                trans_.at<double>(i, j) = 0.99;
+                            }
+                        }
+                    }
+
+                    // Special handling for very dark regions
+                    if (darkchannel.at<double>(i, j) < 0.02) {
+                        trans_.at<double>(i, j) = std::max(trans_.at<double>(i, j), 0.4);
+                    }
+                }
             }
 
-            // Merge channels and convert back to 8-bit
+            // Process each channel with improved scene reconstruction
+            cv::Mat result_channels[3];
+            for (int c = 0; c < 3; c++) {
+                result_channels[c] = cv::Mat(img_double.size().height, img_double.size().width, CV_64F);
+            }
+
+            // Recover the scene
+            for (int i = 0; i < img_double.rows; i++) {
+                for (int j = 0; j < img_double.cols; j++) {
+                    double t = trans_.at<double>(i, j);
+
+                    // Process each channel with the dehaze formula
+                    for (int c = 0; c < 3; c++) {
+                        double val = img_double.at<cv::Vec3d>(i, j)[c];
+                        double A = atmospheric_light[c];
+
+                        // Apply recovery formula with improved stability
+                        double recovered = ((val - A) / t) + A;
+                        recovered = std::max(0.0, std::min(1.0, recovered));
+
+                        result_channels[c].at<double>(i, j) = recovered;
+                    }
+                }
+            }
+
+            // Merge channels
             cv::Mat res;
-            cv::merge(channels, 3, res);
+            cv::merge(result_channels, 3, res);
 
-            // Normalize result
-            double maxv;
-            cv::minMaxLoc(res, nullptr, &maxv, nullptr, nullptr);
-            if (maxv > 0) {
-                res /= maxv;
+            // Apply final color adjustment and tone mapping
+            for (int i = 0; i < res.rows; i++) {
+                for (int j = 0; j < res.cols; j++) {
+                    cv::Vec3d& val = res.at<cv::Vec3d>(i, j);
+
+                    // Calculate luminance for adjustment
+                    double lum = 0.299 * val[2] + 0.587 * val[1] + 0.114 * val[0];
+
+                    // Apply mild saturation correction for extreme values
+                    for (int c = 0; c < 3; c++) {
+                        if (val[c] > 0.8 || val[c] < 0.2) {
+                            val[c] = val[c] * 0.85 + lum * 0.15;
+                        }
+
+                        // Apply brightness adjustment based on scene type
+                        if (lum < 0.5) {
+                            // Brighten darker scenes
+                            val[c] = std::pow(val[c], 0.9);
+                        }
+                        else {
+                            // Slightly reduce brightness in bright scenes
+                            val[c] = std::pow(val[c], 1.05);
+                        }
+
+                        // Final bounds check
+                        val[c] = std::max(0.0, std::min(1.0, val[c]));
+                    }
+                }
             }
-            res *= 255;
-            res.convertTo(res, CV_8UC3);
+
+            // Convert back to 8-bit format
+            res *= 255.0;
+            cv::Mat result;
+            res.convertTo(result, CV_8UC3);
 
             // End timing for scene reconstruction
             auto reconstructionEndTime = std::chrono::high_resolution_clock::now();
@@ -205,7 +322,7 @@ namespace DarkChannel {
             std::cout << "Total Execution Time: " << lastTimingInfo.totalTime << " ms" << std::endl;
             std::cout << "========================================" << std::endl;
 
-            return res;
+            return result;
         }
         catch (const cv::Exception& e) {
             std::cerr << "OpenCV Exception: " << e.what() << std::endl;

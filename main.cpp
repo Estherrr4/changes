@@ -1,5 +1,6 @@
 #include "dehaze.h"
 #include "dehaze_parallel.h"
+#include "custom_types.h"
 #include <cuda_runtime.h>
 #include <iostream>
 #include <algorithm>
@@ -68,17 +69,16 @@ std::string getImageFile() {
 }
 
 // Function to resize large images while maintaining aspect ratio
-cv::Mat resizeImageIfTooLarge(const cv::Mat& img, int maxDimension = 1200) {
+ImageU8 resizeImageIfTooLarge(const ImageU8& img, int maxDimension = 1200) {
     // Check if the image is too large
-    if (img.cols > maxDimension || img.rows > maxDimension) {
-        cv::Mat resized;
-        double scale = (double)maxDimension / (img.cols > img.rows ? img.cols : img.rows);
-        int newWidth = static_cast<int>(img.cols * scale);
-        int newHeight = static_cast<int>(img.rows * scale);
+    if (img.width > maxDimension || img.height > maxDimension) {
+        double scale = static_cast<double>(maxDimension) / (img.width > img.height ? img.width : img.height);
+        int newWidth = static_cast<int>(img.width * scale);
+        int newHeight = static_cast<int>(img.height * scale);
 
-        cv::resize(img, resized, cv::Size(newWidth, newHeight), 0, 0, cv::INTER_AREA);
-        std::cout << "Image resized from " << img.cols << "x" << img.rows
-            << " to " << resized.cols << "x" << resized.rows << std::endl;
+        ImageU8 resized = img.resize(newWidth, newHeight);
+        std::cout << "Image resized from " << img.width << "x" << img.height
+            << " to " << resized.width << "x" << resized.height << std::endl;
         return resized;
     }
     return img;
@@ -93,49 +93,52 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
 
         std::cout << "Processing image: " << normalized_path << std::endl;
 
-        // Load image
-        cv::Mat original_img = cv::imread(normalized_path);
-        if (original_img.empty()) {
+        // Load image using OpenCV (only for I/O)
+        cv::Mat cv_original_img = cv::imread(normalized_path);
+        if (cv_original_img.empty()) {
             std::cerr << "Error: Failed to load image: " << normalized_path << std::endl;
             waitForKeyPress();
             return false;
         }
 
+        // Convert to our custom Image type
+        ImageU8 original_img = DarkChannel::matToImage(cv_original_img);
+
         // Extract just the filename for the output file
         size_t pos = normalized_path.find_last_of('/');
         std::string img_name = (pos != std::string::npos) ? normalized_path.substr(pos + 1) : normalized_path;
 
-        std::cout << "Image loaded successfully. Original size: " << original_img.cols << "x" << original_img.rows << std::endl;
+        std::cout << "Image loaded successfully. Original size: " << original_img.width << "x" << original_img.height << std::endl;
 
         // Resize large images for faster processing
-        cv::Mat img = resizeImageIfTooLarge(original_img, 1200);
+        ImageU8 img = resizeImageIfTooLarge(original_img, 1200);
 
         // Save original and resized version of input image for reference
         std::string original_path = project_path + "original_" + img_name;
-        cv::imwrite(original_path, original_img);
+        cv::imwrite(original_path, DarkChannel::imageToMat(original_img));
 
-        if (img.data != original_img.data) {
+        if (img.get_data() != original_img.get_data()) {
             std::string resized_input_path = project_path + "resized_input_" + img_name;
-            cv::imwrite(resized_input_path, img);
+            cv::imwrite(resized_input_path, DarkChannel::imageToMat(img));
             std::cout << "Original image saved as: " << original_path << std::endl;
             std::cout << "Resized input saved as: " << resized_input_path << std::endl;
         }
 
         // Process with serial version
         std::cout << "\nRunning serial version..." << std::endl;
-        cv::Mat serial_result = DarkChannel::dehaze(img);
+        ImageU8 serial_result = DarkChannel::dehaze(img);
         DarkChannel::TimingInfo serial_timing = DarkChannel::getLastTimingInfo();
 
         // Process with OpenMP version
         std::cout << "\nRunning OpenMP version..." << std::endl;
         int num_threads = get_max(1, omp_get_max_threads());
         std::cout << "Using " << num_threads << " OpenMP threads" << std::endl;
-        cv::Mat openmp_result = DarkChannel::dehazeParallel(img, num_threads);
+        ImageU8 openmp_result = DarkChannel::dehazeParallel(img, num_threads);
         DarkChannel::TimingInfo openmp_timing = DarkChannel::getLastTimingInfo();
 
         // Check CUDA availability
         bool cuda_available = DarkChannel::isCudaAvailable();
-        cv::Mat cuda_result;
+        ImageU8 cuda_result;
         DarkChannel::TimingInfo cuda_timing;
 
         if (cuda_available) {
@@ -184,7 +187,7 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
         }
 
         double omp_speedup = (serial_timing.darkChannelTime > 0) ?
-        (serial_timing.darkChannelTime / openmp_timing.darkChannelTime) : 0.0;
+            (serial_timing.darkChannelTime / openmp_timing.darkChannelTime) : 0.0;
         std::cout << std::setw(17) << omp_speedup;
 
         if (cuda_available) {
@@ -203,7 +206,7 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
         }
 
         omp_speedup = (serial_timing.atmosphericLightTime > 0) ?
-        (serial_timing.atmosphericLightTime / openmp_timing.atmosphericLightTime) : 0.0;
+            (serial_timing.atmosphericLightTime / openmp_timing.atmosphericLightTime) : 0.0;
         std::cout << std::setw(17) << omp_speedup;
 
         if (cuda_available) {
@@ -222,7 +225,7 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
         }
 
         omp_speedup = (serial_timing.transmissionTime > 0) ?
-        (serial_timing.transmissionTime / openmp_timing.transmissionTime) : 0.0;
+            (serial_timing.transmissionTime / openmp_timing.transmissionTime) : 0.0;
         std::cout << std::setw(17) << omp_speedup;
 
         if (cuda_available) {
@@ -241,7 +244,7 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
         }
 
         omp_speedup = (serial_timing.refinementTime > 0) ?
-        (serial_timing.refinementTime / openmp_timing.refinementTime) : 0.0;
+            (serial_timing.refinementTime / openmp_timing.refinementTime) : 0.0;
         std::cout << std::setw(17) << omp_speedup;
 
         if (cuda_available) {
@@ -260,7 +263,7 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
         }
 
         omp_speedup = (serial_timing.reconstructionTime > 0) ?
-        (serial_timing.reconstructionTime / openmp_timing.reconstructionTime) : 0.0;
+            (serial_timing.reconstructionTime / openmp_timing.reconstructionTime) : 0.0;
         std::cout << std::setw(17) << omp_speedup;
 
         if (cuda_available) {
@@ -279,7 +282,7 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
         }
 
         omp_speedup = (serial_timing.totalTime > 0) ?
-        (serial_timing.totalTime / openmp_timing.totalTime) : 0.0;
+            (serial_timing.totalTime / openmp_timing.totalTime) : 0.0;
         std::cout << std::setw(17) << omp_speedup;
 
         if (cuda_available) {
@@ -291,18 +294,17 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
 
         std::cout << std::string(dividerWidth, '=') << std::endl;
 
-
-        // Save results
+        // Save results (convert back to OpenCV Mat for saving)
         std::string serial_output_path = project_path + "serial_dehazed_" + img_name;
         std::string openmp_output_path = project_path + "openmp_dehazed_" + img_name;
         std::string cuda_output_path;
 
-        cv::imwrite(serial_output_path, serial_result);
-        cv::imwrite(openmp_output_path, openmp_result);
+        cv::imwrite(serial_output_path, DarkChannel::imageToMat(serial_result));
+        cv::imwrite(openmp_output_path, DarkChannel::imageToMat(openmp_result));
 
         if (cuda_available) {
             cuda_output_path = project_path + "cuda_dehazed_" + img_name;
-            cv::imwrite(cuda_output_path, cuda_result);
+            cv::imwrite(cuda_output_path, DarkChannel::imageToMat(cuda_result));
         }
 
         std::cout << "Results saved as: " << std::endl;
@@ -312,63 +314,64 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
             std::cout << "  CUDA: " << cuda_output_path << std::endl;
         }
 
-        // Create copies for display to avoid modifying original data
-        cv::Mat display_img = img.clone();
-        cv::Mat display_serial = serial_result.clone();
-        cv::Mat display_openmp = openmp_result.clone();
-        cv::Mat display_cuda;
+        // Convert our custom Image back to OpenCV Mat for display
+        cv::Mat cv_display_img = DarkChannel::imageToMat(img);
+        cv::Mat cv_display_serial = DarkChannel::imageToMat(serial_result);
+        cv::Mat cv_display_openmp = DarkChannel::imageToMat(openmp_result);
+        cv::Mat cv_display_cuda;
+
         if (cuda_available && !cuda_result.empty()) {
-            display_cuda = cuda_result.clone();
+            cv_display_cuda = DarkChannel::imageToMat(cuda_result);
         }
 
         // Check if result images are valid
         std::cout << "\nValidating result images..." << std::endl;
-        std::cout << "Original: " << display_img.cols << "x" << display_img.rows
-            << " channels: " << display_img.channels() << std::endl;
-        std::cout << "Serial: " << display_serial.cols << "x" << display_serial.rows
-            << " channels: " << display_serial.channels() << std::endl;
-        std::cout << "OpenMP: " << display_openmp.cols << "x" << display_openmp.rows
-            << " channels: " << display_openmp.channels() << std::endl;
+        std::cout << "Original: " << cv_display_img.cols << "x" << cv_display_img.rows
+            << " channels: " << cv_display_img.channels() << std::endl;
+        std::cout << "Serial: " << cv_display_serial.cols << "x" << cv_display_serial.rows
+            << " channels: " << cv_display_serial.channels() << std::endl;
+        std::cout << "OpenMP: " << cv_display_openmp.cols << "x" << cv_display_openmp.rows
+            << " channels: " << cv_display_openmp.channels() << std::endl;
 
-        if (cuda_available && !display_cuda.empty()) {
-            std::cout << "CUDA: " << display_cuda.cols << "x" << display_cuda.rows
-                << " channels: " << display_cuda.channels() << std::endl;
+        if (cuda_available && !cv_display_cuda.empty()) {
+            std::cout << "CUDA: " << cv_display_cuda.cols << "x" << cv_display_cuda.rows
+                << " channels: " << cv_display_cuda.channels() << std::endl;
         }
 
         // Calculate display size based on orientation
         int maxDisplayDimension = 800;
-        bool isPortrait = (img.rows > img.cols);
+        bool isPortrait = (img.height > img.width);
 
         int displayWidth, displayHeight;
         double scale;
 
         if (isPortrait) {
             // For portrait images, use height as the limiting factor
-            scale = (double)maxDisplayDimension / img.rows;
+            scale = (double)maxDisplayDimension / img.height;
             displayHeight = maxDisplayDimension;
-            displayWidth = static_cast<int>(img.cols * scale);
+            displayWidth = static_cast<int>(img.width * scale);
         }
         else {
             // For landscape images, use width as the limiting factor
-            scale = (double)maxDisplayDimension / img.cols;
+            scale = (double)maxDisplayDimension / img.width;
             displayWidth = maxDisplayDimension;
-            displayHeight = static_cast<int>(img.rows * scale);
+            displayHeight = static_cast<int>(img.height * scale);
         }
 
-        // Resize images for display
-        if (display_img.cols != displayWidth || display_img.rows != displayHeight) {
-            cv::resize(display_img, display_img, cv::Size(displayWidth, displayHeight), 0, 0, cv::INTER_AREA);
-            cv::resize(display_serial, display_serial, cv::Size(displayWidth, displayHeight), 0, 0, cv::INTER_AREA);
-            cv::resize(display_openmp, display_openmp, cv::Size(displayWidth, displayHeight), 0, 0, cv::INTER_AREA);
+        // Resize images for display using OpenCV for UI
+        if (cv_display_img.cols != displayWidth || cv_display_img.rows != displayHeight) {
+            cv::resize(cv_display_img, cv_display_img, cv::Size(displayWidth, displayHeight), 0, 0, cv::INTER_AREA);
+            cv::resize(cv_display_serial, cv_display_serial, cv::Size(displayWidth, displayHeight), 0, 0, cv::INTER_AREA);
+            cv::resize(cv_display_openmp, cv_display_openmp, cv::Size(displayWidth, displayHeight), 0, 0, cv::INTER_AREA);
 
-            if (cuda_available && !display_cuda.empty()) {
-                cv::resize(display_cuda, display_cuda, cv::Size(displayWidth, displayHeight), 0, 0, cv::INTER_AREA);
+            if (cuda_available && !cv_display_cuda.empty()) {
+                cv::resize(cv_display_cuda, cv_display_cuda, cv::Size(displayWidth, displayHeight), 0, 0, cv::INTER_AREA);
             }
 
             std::cout << "Images resized for display to " << displayWidth << "x" << displayHeight << std::endl;
         }
 
-        // Check intensity and normalize if too dark
+        // Check intensity and normalize if too dark using OpenCV for UI
         auto checkAndNormalize = [](cv::Mat& image, const std::string& name) {
             if (!image.empty()) {
                 cv::Scalar meanIntensity = cv::mean(image);
@@ -384,27 +387,26 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
             }
             };
 
-        checkAndNormalize(display_openmp, "OpenMP");
-        if (cuda_available && !display_cuda.empty()) {
-            checkAndNormalize(display_cuda, "CUDA");
+        checkAndNormalize(cv_display_openmp, "OpenMP");
+        if (cuda_available && !cv_display_cuda.empty()) {
+            checkAndNormalize(cv_display_cuda, "CUDA");
         }
 
+        // Display images using OpenCV for UI
         cv::namedWindow("Original", cv::WINDOW_NORMAL);
-        cv::imshow("Original", display_img);
+        cv::imshow("Original", cv_display_img);
         cv::resizeWindow("Original", displayWidth, displayHeight);
         cv::moveWindow("Original", 50, 50);
         cv::waitKey(100);  // Small delay to ensure window is created and visible
 
-
         cv::namedWindow("Serial Result", cv::WINDOW_NORMAL);
-        cv::imshow("Serial Result", display_serial);
+        cv::imshow("Serial Result", cv_display_serial);
         cv::resizeWindow("Serial Result", displayWidth, displayHeight);
         cv::moveWindow("Serial Result", 50 + displayWidth + 20, 50);
         cv::waitKey(100);  // Small delay
 
-
         cv::namedWindow("OpenMP Result", cv::WINDOW_NORMAL);
-        cv::imshow("OpenMP Result", display_openmp);
+        cv::imshow("OpenMP Result", cv_display_openmp);
         cv::resizeWindow("OpenMP Result", displayWidth, displayHeight);
 
         // Position based on orientation
@@ -414,12 +416,11 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
         else {
             cv::moveWindow("OpenMP Result", 50, 50 + displayHeight + 20);
         }
-        cv::waitKey(100);  
+        cv::waitKey(100);
 
-
-        if (cuda_available && !display_cuda.empty()) {
+        if (cuda_available && !cv_display_cuda.empty()) {
             cv::namedWindow("CUDA Result", cv::WINDOW_NORMAL);
-            cv::imshow("CUDA Result", display_cuda);
+            cv::imshow("CUDA Result", cv_display_cuda);
             cv::resizeWindow("CUDA Result", displayWidth, displayHeight);
 
             if (isPortrait) {
@@ -428,7 +429,7 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
             else {
                 cv::moveWindow("CUDA Result", 50 + displayWidth + 20, 50 + displayHeight + 20);
             }
-            cv::waitKey(100);  
+            cv::waitKey(100);
         }
 
         cv::waitKey(1);
@@ -436,7 +437,8 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
         std::cout << "\nViewing results. Press any key in any image window to continue..." << std::endl;
         cv::waitKey(0);
 
-        if (cuda_available && !display_cuda.empty()) {
+        // Clean up OpenCV windows
+        if (cuda_available && !cv_display_cuda.empty()) {
             cv::destroyWindow("CUDA Result");
             cv::waitKey(50);  // Small delay
         }
@@ -461,7 +463,6 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
     }
 }
 
-
 void exportPerformanceDataToCSV(
     const std::string& filename,
     const std::vector<std::string>& imagePaths,
@@ -481,16 +482,15 @@ void exportPerformanceDataToCSV(
     }
     csvFile << std::endl;
 
-
     for (size_t i = 0; i < imagePaths.size(); i++) {
-        cv::Mat img = cv::imread(imagePaths[i]);
-        std::string orientation = (img.rows > img.cols) ? "Portrait" : "Landscape";
-        std::string imageSize = std::to_string(img.cols) + "x" + std::to_string(img.rows);
+        // Use OpenCV only for loading the image dimensions
+        cv::Mat cv_img = cv::imread(imagePaths[i]);
+        std::string orientation = (cv_img.rows > cv_img.cols) ? "Portrait" : "Landscape";
+        std::string imageSize = std::to_string(cv_img.cols) + "x" + std::to_string(cv_img.rows);
         std::string imageName = imagePaths[i].substr(imagePaths[i].find_last_of("/\\") + 1);
 
         const DarkChannel::TimingInfo& serial = timingPairs[i].first;
         const DarkChannel::TimingInfo& openmp = timingPairs[i].second;
-
 
         auto writeRow = [&](const std::string& stage, double serialTime, double openmpTime) {
             double openmpSpeedup = (serialTime > 0) ? (serialTime / openmpTime) : 0.0;
@@ -586,12 +586,12 @@ int main(int argc, char** argv) {
                 std::cout << "  2: Use file dialog to select image" << std::endl;
                 std::cout << "  3: Process multiple images" << std::endl;
                 std::cout << "  4: Check CUDA availability" << std::endl;
-                std::cout << "  5: Run performance benchmark (for Colab plotting)" << std::endl;
+                std::cout << "  5: Run performance benchmark (for plotting)" << std::endl;
                 std::cout << "  0: Exit" << std::endl;
 
                 std::cout << "\nEnter your choice (0-5): ";
                 std::cin >> choice;
-                std::cin.ignore(); 
+                std::cin.ignore();
 
                 switch (choice) {
                 case 0:
@@ -634,7 +634,7 @@ int main(int argc, char** argv) {
                         int subChoice;
                         std::cout << "Choice: ";
                         std::cin >> subChoice;
-                        std::cin.ignore(); 
+                        std::cin.ignore();
 
                         if (subChoice == 0) {
                             break;
@@ -714,7 +714,7 @@ int main(int argc, char** argv) {
                     int numImages;
                     std::cout << "Enter number of images to benchmark: ";
                     std::cin >> numImages;
-                    std::cin.ignore(); 
+                    std::cin.ignore();
 
                     if (numImages <= 0) {
                         std::cout << "Invalid number. Returning to main menu." << std::endl;
@@ -745,37 +745,40 @@ int main(int argc, char** argv) {
                             imgPath = getImageFile();
                             if (imgPath.empty()) {
                                 std::cout << "No file selected. Skipping this image." << std::endl;
-                                i--; 
+                                i--;
                                 continue;
                             }
                         }
                         else {
                             std::cout << "Invalid choice. Skipping this image." << std::endl;
-                            i--; 
+                            i--;
                             continue;
                         }
 
                         // Process the image silently
                         std::cout << "Processing image: " << imgPath << std::endl;
 
-                        cv::Mat img = cv::imread(imgPath);
-                        if (img.empty()) {
+                        // Load image using OpenCV (only for I/O)
+                        cv::Mat cv_img = cv::imread(imgPath);
+                        if (cv_img.empty()) {
                             std::cerr << "Error: Failed to load image: " << imgPath << std::endl;
-                            i--; 
+                            i--;
                             continue;
                         }
 
-                        cv::Mat processImg = resizeImageIfTooLarge(img, 1200);
+                        // Convert to our custom Image type and resize if needed
+                        ImageU8 img = DarkChannel::matToImage(cv_img);
+                        ImageU8 processImg = resizeImageIfTooLarge(img, 1200);
 
                         // Process with Serial
                         std::cout << "  Running serial version..." << std::endl;
-                        cv::Mat serial_result = DarkChannel::dehaze(processImg);
+                        ImageU8 serial_result = DarkChannel::dehaze(processImg);
                         DarkChannel::TimingInfo serial_timing = DarkChannel::getLastTimingInfo();
 
                         // Process with OpenMP
                         std::cout << "  Running OpenMP version..." << std::endl;
                         int num_threads = get_max(1, omp_get_max_threads());
-                        cv::Mat openmp_result = DarkChannel::dehazeParallel(processImg, num_threads);
+                        ImageU8 openmp_result = DarkChannel::dehazeParallel(processImg, num_threads);
                         DarkChannel::TimingInfo openmp_timing = DarkChannel::getLastTimingInfo();
 
                         // Store the timings
@@ -787,7 +790,7 @@ int main(int argc, char** argv) {
                         if (localCudaAvailable) {
                             std::cout << "  Running CUDA version..." << std::endl;
                             try {
-                                cv::Mat cuda_result = DarkChannel::dehaze_cuda(processImg);
+                                ImageU8 cuda_result = DarkChannel::dehaze_cuda(processImg);
                                 DarkChannel::TimingInfo cuda_timing = DarkChannel::getLastTimingInfo();
                                 cudaTimings.push_back(cuda_timing);
                             }
@@ -813,12 +816,12 @@ int main(int argc, char** argv) {
                     );
 
                     std::cout << "\nBenchmarking complete. Data exported to: " << csvFilename << std::endl;
-                    std::cout << "You can now import this CSV file into Google Colab for plotting." << std::endl;
+                    std::cout << "You can now import this CSV file for plotting." << std::endl;
 
                     waitForKeyPress();
                     break;
                 }
-                
+
                 default:
                     std::cout << "Invalid choice. Please try again." << std::endl;
                     waitForKeyPress();

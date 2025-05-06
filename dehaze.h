@@ -2,8 +2,9 @@
 #ifndef IMAGE_PROCESSING_FROM_SCRATCH_DEHAZE_H
 #define IMAGE_PROCESSING_FROM_SCRATCH_DEHAZE_H
 
-#include <opencv2/opencv.hpp>
+#include "custom_types.h"
 #include <stdexcept>
+#include <opencv2/opencv.hpp> // Keep this only for IO operations, not algorithms
 
 namespace DarkChannel {
     // Error checking macro
@@ -15,19 +16,28 @@ namespace DarkChannel {
 
     // Structure to store timing information
     struct TimingInfo {
-        double darkChannelTime = 0.0;      
-        double atmosphericLightTime = 0.0; 
-        double transmissionTime = 0.0;     
-        double refinementTime = 0.0;       
-        double reconstructionTime = 0.0;   
-        double totalTime = 0.0;            
+        double darkChannelTime = 0.0;
+        double atmosphericLightTime = 0.0;
+        double transmissionTime = 0.0;
+        double refinementTime = 0.0;
+        double reconstructionTime = 0.0;
+        double totalTime = 0.0;
     };
 
+    // Convert OpenCV Mat to custom image format (only for IO purposes)
+    ImageU8 matToImage(const cv::Mat& mat);
+
+    // Convert custom image format back to OpenCV Mat (only for IO purposes)
+    cv::Mat imageToMat(const ImageU8& img);
+
     // Serial implementation
-    cv::Mat dehaze(const cv::Mat& img);
+    ImageU8 dehaze(const ImageU8& img);
+
+    // OpenMP implementation
+    ImageU8 dehazeParallel(const ImageU8& img, int numThreads = 1);
 
     // CUDA implementation
-    cv::Mat dehaze_cuda(const cv::Mat& img);
+    ImageU8 dehaze_cuda(const ImageU8& img);
 
     // Function to get the last timing information
     TimingInfo getLastTimingInfo();

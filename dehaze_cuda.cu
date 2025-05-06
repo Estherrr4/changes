@@ -1,10 +1,13 @@
+// dehaze_cuda.cu
 #include "dehaze.h"
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
-#include <opencv2/opencv.hpp>
 #include <iostream>
 #include <chrono>
 #include <stdio.h>
+#include <vector>
+#include <algorithm>
+#include <cmath>
 
 // Define CUDA_ENABLED for isCudaAvailable() function
 #define CUDA_ENABLED
@@ -75,12 +78,13 @@ extern "C" void launchCudaPart() {
 }
 //Check CUDA Part End
 
-// Optimized constant memory for performance
-__constant__ float c_eps = 0.1f;
+// Optimized constant memory for performance - using double for matching precision
+__constant__ double c_eps = 0.1;
 __constant__ int c_window_radius = 8; // For box filter
 
-// Improved dark channel kernel with shared memory optimization
-__global__ void darkChannelKernel(const unsigned char* imgData, float* darkChannel, int width, int height, int channels, int patch_radius) {
+// Improved dark channel kernel with shared memory optimization - using double precision
+__global__ void darkChannelKernel(const unsigned char* imgData, double* darkChannel,
+    int width, int height, int channels, int patch_radius) {
     extern __shared__ unsigned char sharedImg[];
 
     int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -132,7 +136,7 @@ __global__ void darkChannelKernel(const unsigned char* imgData, float* darkChann
     if (x >= width || y >= height) return;
 
     // Calculate dark channel for this pixel
-    float minVal = 1.0f;
+    double minVal = 1.0;
 
     for (int dy = -patch_radius; dy <= patch_radius; dy++) {
         for (int dx = -patch_radius; dx <= patch_radius; dx++) {
@@ -144,12 +148,12 @@ __global__ void darkChannelKernel(const unsigned char* imgData, float* darkChann
                 int shared_idx = (sy * block_width + sx) * channels;
 
                 // Find minimum across RGB channels
-                float b = sharedImg[shared_idx] / 255.0f;
-                float g = sharedImg[shared_idx + 1] / 255.0f;
-                float r = sharedImg[shared_idx + 2] / 255.0f;
+                double b = sharedImg[shared_idx] / 255.0;
+                double g = sharedImg[shared_idx + 1] / 255.0;
+                double r = sharedImg[shared_idx + 2] / 255.0;
 
-                float pixelMin = fminf(r, fminf(g, b));
-                minVal = fminf(minVal, pixelMin);
+                double pixelMin = fmin(r, fmin(g, b));
+                minVal = fmin(minVal, pixelMin);
             }
         }
     }
@@ -157,14 +161,30 @@ __global__ void darkChannelKernel(const unsigned char* imgData, float* darkChann
     darkChannel[y * width + x] = minVal;
 }
 
-// Optimized transmission estimation kernel
-__global__ void transmissionKernel(const unsigned char* imgData, const float* atmospheric, float* transmission, int width, int height, int channels, int patch_radius, float omega) {
+// Convert RGB to grayscale with double precision
+__global__ void rgbToGrayKernel(const unsigned char* rgb, double* gray, int width, int height, int channels) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) return;
+
+    const int idx = y * width + x;
+    const int rgbIdx = idx * channels;
+
+    // Convert RGB to grayscale using standard weights
+    gray[idx] = (0.299 * rgb[rgbIdx + 2] + 0.587 * rgb[rgbIdx + 1] + 0.114 * rgb[rgbIdx]) / 255.0;
+}
+
+// Optimized transmission estimation kernel - double precision
+__global__ void transmissionKernel(const unsigned char* imgData, const double* atmospheric,
+    double* transmission, int width, int height,
+    int channels, int patch_radius, double omega) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x >= width || y >= height) return;
 
-    float minVal = 1.0f;
+    double minVal = 1.0;
     int idx = y * width + x;
 
     // Search through patch around current pixel
@@ -177,217 +197,140 @@ __global__ void transmissionKernel(const unsigned char* imgData, const float* at
                 int nidx = (ny * width + nx) * channels;
 
                 // Normalize by atmospheric light and find minimum
-                float b = imgData[nidx] / 255.0f / atmospheric[0];
-                float g = imgData[nidx + 1] / 255.0f / atmospheric[1];
-                float r = imgData[nidx + 2] / 255.0f / atmospheric[2];
+                double b = imgData[nidx] / 255.0 / atmospheric[0];
+                double g = imgData[nidx + 1] / 255.0 / atmospheric[1];
+                double r = imgData[nidx + 2] / 255.0 / atmospheric[2];
 
-                float pixelMin = fminf(r, fminf(g, b));
-                minVal = fminf(minVal, pixelMin);
+                double pixelMin = fmin(r, fmin(g, b));
+                minVal = fmin(minVal, pixelMin);
             }
         }
     }
 
-    // Calculate transmission with a more conservative omega
-    transmission[idx] = 1.0f - (omega * 0.9f) * minVal;
+    // Calculate transmission
+    transmission[idx] = 1.0 - omega * minVal;
 }
 
-// Sharp box filter implementation for guided filter
-__global__ void boxFilterKernel(const float* input, float* output, int width, int height, int radius) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+// Box filter kernel for guided filter with double precision
+__global__ void boxFilterKernel(const double* input, double* output, int width, int height, int radius) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x >= width || y >= height) return;
 
-    const int idx = y * width + x;
-    float sum = 0.0f;
+    double sum = 0.0;
     int count = 0;
 
-    // Calculate the box filter by directly summing values
-    for (int j = max(0, y - radius); j <= min(height - 1, y + radius); j++) {
-        for (int i = max(0, x - radius); i <= min(width - 1, x + radius); i++) {
-            sum += input[j * width + i];
-            count++;
+    // Simple box filter implementation
+    for (int dy = -radius; dy <= radius; dy++) {
+        for (int dx = -radius; dx <= radius; dx++) {
+            int nx = x + dx;
+            int ny = y + dy;
+
+            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                sum += input[ny * width + nx];
+                count++;
+            }
         }
     }
 
-    // Normalize
-    output[idx] = sum / count;
+    output[y * width + x] = sum / count;
 }
 
-// Subtraction kernel
-__global__ void subtractKernel(const float* a, const float* b, float* result, int width, int height) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+// Element-wise multiply kernel with double precision
+__global__ void multiplyKernel(const double* a, const double* b, double* result, int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x >= width || y >= height) return;
 
-    const int idx = y * width + x;
-    result[idx] = a[idx] - b[idx];
-}
-
-// Addition kernel
-__global__ void addKernel(const float* a, const float* b, float* result, int width, int height) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (x >= width || y >= height) return;
-
-    const int idx = y * width + x;
-    result[idx] = a[idx] + b[idx];
-}
-
-// Multiplication kernel
-__global__ void multiplyKernel(const float* a, const float* b, float* result, int width, int height) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (x >= width || y >= height) return;
-
-    const int idx = y * width + x;
+    int idx = y * width + x;
     result[idx] = a[idx] * b[idx];
 }
 
-// Division kernel with regularization
-__global__ void divideKernel(const float* a, const float* b, float* result, int width, int height, float eps) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+// Calculate variance: var = mean_II - mean_I * mean_I
+__global__ void varianceKernel(double* var_I, const double* mean_I, int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x >= width || y >= height) return;
 
-    const int idx = y * width + x;
-    result[idx] = a[idx] / (b[idx] + eps);
+    int idx = y * width + x;
+    double meanI = mean_I[idx];
+    var_I[idx] = var_I[idx] - meanI * meanI;
 }
 
-// Improved bilinear upsampling kernel with edge preservation
-__global__ void upsampleKernel(const float* input, float* output, int srcWidth, int srcHeight, int dstWidth, int dstHeight) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (x >= dstWidth || y >= dstHeight) return;
-
-    // Map destination coordinates to source coordinates
-    float srcX = x * ((float)srcWidth / dstWidth);
-    float srcY = y * ((float)srcHeight / dstHeight);
-
-    // Get the four surrounding pixels
-    int x0 = floor(srcX);
-    int y0 = floor(srcY);
-    int x1 = min(x0 + 1, srcWidth - 1);
-    int y1 = min(y0 + 1, srcHeight - 1);
-
-    // Calculate interpolation weights
-    float wx = srcX - x0;
-    float wy = srcY - y0;
-
-    // Perform bilinear interpolation
-    float top = (1.0f - wx) * input[y0 * srcWidth + x0] + wx * input[y0 * srcWidth + x1];
-    float bottom = (1.0f - wx) * input[y1 * srcWidth + x0] + wx * input[y1 * srcWidth + x1];
-    float value = (1.0f - wy) * top + wy * bottom;
-
-    // Store the result
-    output[y * dstWidth + x] = value;
-}
-
-// Convert RGB to grayscale
-__global__ void rgbToGrayKernel(const unsigned char* rgb, float* gray, int width, int height, int channels) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+// Calculate covariance: cov = mean_Ip - mean_I * mean_p
+__global__ void covarianceKernel(double* cov_Ip, const double* mean_I, const double* mean_p,
+    double* mean_Ip, int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x >= width || y >= height) return;
 
-    const int idx = y * width + x;
-    const int rgbIdx = idx * channels;
-
-    // Convert RGB to grayscale using standard weights
-    gray[idx] = (0.299f * rgb[rgbIdx + 2] + 0.587f * rgb[rgbIdx + 1] + 0.114f * rgb[rgbIdx]) / 255.0f;
+    int idx = y * width + x;
+    cov_Ip[idx] = mean_Ip[idx] - mean_I[idx] * mean_p[idx];
 }
 
-// Downsampling kernel
-__global__ void downsampleKernel(const float* input, float* output, int srcWidth, int srcHeight, int dstWidth, int dstHeight) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+// Calculate a and b coefficients with double precision
+__global__ void computeCoefficientsKernel(double* a, double* b, const double* cov_Ip,
+    const double* var_I, const double* mean_I,
+    const double* mean_p, int width, int height, double eps) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (x >= dstWidth || y >= dstHeight) return;
+    if (x >= width || y >= height) return;
 
-    // Calculate region to average in source image
-    float scaleX = (float)srcWidth / dstWidth;
-    float scaleY = (float)srcHeight / dstHeight;
+    int idx = y * width + x;
+    a[idx] = cov_Ip[idx] / (var_I[idx] + eps);
+    b[idx] = mean_p[idx] - a[idx] * mean_I[idx];
+}
 
-    int startX = floor(x * scaleX);
-    int endX = floor((x + 1) * scaleX);
-    int startY = floor(y * scaleY);
-    int endY = floor((y + 1) * scaleY);
+// Calculate final guided filter result: q = a * I + b
+__global__ void guidedFilterResultKernel(double* refined, const double* mean_a, const double* mean_b,
+    const double* I, int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // Ensure valid bounds
-    startX = max(0, startX);
-    endX = min(srcWidth - 1, endX);
-    startY = max(0, startY);
-    endY = min(srcHeight - 1, endY);
+    if (x >= width || y >= height) return;
 
-    // Average all pixels in the region
-    float sum = 0.0f;
-    int count = 0;
+    int idx = y * width + x;
+    refined[idx] = mean_a[idx] * I[idx] + mean_b[idx];
 
-    for (int j = startY; j <= endY; j++) {
-        for (int i = startX; i <= endX; i++) {
-            sum += input[j * srcWidth + i];
-            count++;
+    // Clamp to [0,1] range
+    refined[idx] = fmax(0.0, fmin(1.0, refined[idx]));
+}
+
+// Special handling for sky regions (usually top of image)
+__global__ void skyRegionHandlingKernel(double* transmission, const unsigned char* imgData,
+    int width, int height, int channels) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) return;
+
+    // Only process top third of image (matching serial implementation)
+    if (y < height / 3) {
+        int rgbIdx = (y * width + x) * channels;
+        double b = imgData[rgbIdx] / 255.0;       // Blue value
+        double g = imgData[rgbIdx + 1] / 255.0;   // Green value
+        double r = imgData[rgbIdx + 2] / 255.0;   // Red value
+
+        // Match the same sky detection criteria as in serial implementation
+        if ((b > 0.6 && b > r && b > g) || // Blue-dominant sky
+            (b > 0.6 && g > 0.6 && r > 0.6)) { // Bright sky (any color)
+
+            int idx = y * width + x;
+            // Use same transmission value threshold as serial implementation
+            transmission[idx] = fmax(transmission[idx], 0.7);
         }
     }
-
-    output[y * dstWidth + x] = sum / max(count, 1);
 }
 
-// Apply guided filter
-__global__ void applyFilterKernel(const float* a, const float* b, float* output, float* gray, int width, int height) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (x >= width || y >= height) return;
-
-    const int idx = y * width + x;
-
-    // Apply linear transformation: a*I + b
-    output[idx] = a[idx] * gray[idx] + b[idx];
-
-    // Clamp to [0, 1] range
-    output[idx] = fmaxf(0.0f, fminf(1.0f, output[idx]));
-}
-
-// Sharpen kernel for enhancing details
-__global__ void sharpenKernel(const float* input, float* output, int width, int height, float strength) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (x >= width || y >= height || x == 0 || y == 0 || x == width - 1 || y == height - 1) {
-        // Skip border pixels, just copy
-        if (x < width && y < height) {
-            output[y * width + x] = input[y * width + x];
-        }
-        return;
-    }
-
-    const int idx = y * width + x;
-
-    // Simple Laplacian filter
-    float center = input[idx];
-    float top = input[(y - 1) * width + x];
-    float bottom = input[(y + 1) * width + x];
-    float left = input[y * width + (x - 1)];
-    float right = input[y * width + (x + 1)];
-
-    // Apply sharpening: center + strength * (center - average of neighbors)
-    float laplacian = 4.0f * center - top - bottom - left - right;
-    output[idx] = center + strength * laplacian;
-
-    // Clamp result to [0, 1]
-    output[idx] = fmaxf(0.0f, fminf(1.0f, output[idx]));
-}
-
-// Enhanced scene recovery with better quality and sharpness
-__global__ void sceneRecoveryKernel(const unsigned char* imgData, const float* transmission,
-    const float* atmospheric, unsigned char* outputData,
-    int width, int height, int channels, float t0) {
+// Enhanced scene recovery with better quality and double precision
+__global__ void sceneRecoveryKernel(const unsigned char* imgData, const double* transmission,
+    const double* atmospheric, unsigned char* outputData,
+    int width, int height, int channels, double t0) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -397,177 +340,131 @@ __global__ void sceneRecoveryKernel(const unsigned char* imgData, const float* t
     int tidx = y * width + x;
 
     // Higher minimum transmission to preserve detail in dark areas
-    float t = fmaxf(transmission[tidx], t0);
+    double t = fmax(transmission[tidx], t0);
 
-    // Use adaptive tone mapping to prevent over-darkening
-    float intensity = 0.0f;
+    // Create temporary storage for color values to ensure consistent processing
+    double recovered[3];
+    double lum = 0.0;
+
+    // Process each channel first for recovery
     for (int c = 0; c < channels; c++) {
-        intensity += imgData[idx + c] / 255.0f;
-    }
-    intensity /= channels;
-
-    // Adaptive t0 based on intensity and spatial location
-    float adaptive_t0 = t0;
-    if (intensity < 0.3f) {
-        // For darker regions, use higher minimum transmission
-        adaptive_t0 = t0 * 1.5f;
-        t = fmaxf(t, adaptive_t0);
+        double normalized = imgData[idx + c] / 255.0;
+        // Apply dehaze formula J = (I-A)/t + A with bounds checking
+        recovered[c] = ((normalized - atmospheric[c]) / t) + atmospheric[c];
+        // Calculate lum for saturation correction (assuming BGR order)
+        if (c == 0) lum += 0.114 * recovered[c]; // B
+        else if (c == 1) lum += 0.587 * recovered[c]; // G
+        else lum += 0.299 * recovered[c]; // R
     }
 
-    // For sky areas (typically upper portion of image), preserve more haze
-    if (y < height / 3 && intensity > 0.7f) {
-        t = fmaxf(t, 0.4f); // Preserve some atmospheric effect for sky
-    }
-
-    // Process each channel separately with enhanced color preservation
+    // Now apply mild saturation correction and convert to 8-bit
     for (int c = 0; c < channels; c++) {
-        float normalized = imgData[idx + c] / 255.0f;
+        // Apply correction for extreme values to reduce artifacts
+        if (recovered[c] > 0.8 || recovered[c] < 0.2) {
+            recovered[c] = recovered[c] * 0.85 + lum * 0.15;
+        }
 
-        // Modified recovery formula with better exposure control
-        float recovered = (normalized - atmospheric[c]) / t + atmospheric[c];
+        // BRIGHTNESS ADJUSTMENT: Match the brightness level with serial implementation
+        // Apply consistent brightness adjustments based on scene type
+        if (lum < 0.5) {
+            // For darker scenes (like indoor scenes), slightly increase brightness
+            recovered[c] = pow(recovered[c], 0.9);
+        }
+        else {
+            // For brighter scenes, keep as is or slightly reduce brightness
+            recovered[c] = pow(recovered[c], 1.05);
+        }
 
-        // Enhance brightness for dark scenes (gamma correction)
-        recovered = powf(recovered, 0.85f);
-
-        // Apply additional contrast but keep reasonable limits
-        recovered = (recovered - 0.5f) * 1.2f + 0.5f;
-
-        // Clamp to [0, 1] range
-        recovered = fminf(fmaxf(recovered, 0.0f), 1.0f);
-
-        // Convert back to 8-bit
-        outputData[idx + c] = static_cast<unsigned char>(recovered * 255.0f);
+        // Ensure bounds and convert to 8-bit
+        recovered[c] = fmin(fmax(recovered[c], 0.0), 1.0);
+        outputData[idx + c] = static_cast<unsigned char>(recovered[c] * 255.0);
     }
 }
 
-// Guide filter implementation for CUDA with improved sharpness
-void guidedFilterCuda(const unsigned char* d_I, float* d_p, float* d_output,
-    int width, int height, int channels, int r, float eps, int s) {
-    // Define block and grid dimensions
+// Guided filter implementation for CUDA with double precision
+void guidedFilterCuda(const unsigned char* d_img, double* d_transmission, double* d_refined,
+    int width, int height, int channels, int r, double eps) {
+    // Allocate device memory for temporary variables
+    double* d_I_gray = nullptr, * d_mean_I = nullptr, * d_mean_p = nullptr;
+    double* d_mean_Ip = nullptr, * d_var_I = nullptr, * d_a = nullptr, * d_b = nullptr;
+    double* d_mean_a = nullptr, * d_mean_b = nullptr, * d_cov_Ip = nullptr, * d_mean_II = nullptr;
+    double* d_temp = nullptr;
+
     dim3 blockSize(16, 16);
-    dim3 fullGridSize((width + blockSize.x - 1) / blockSize.x,
+    dim3 gridSize((width + blockSize.x - 1) / blockSize.x,
         (height + blockSize.y - 1) / blockSize.y);
 
-    // Calculate small dimensions - smaller subsample factor for better quality
-    s = min(s, 3); // Limit subsample factor to maintain quality
-    int smallWidth = width / s;
-    int smallHeight = height / s;
-    dim3 smallGridSize((smallWidth + blockSize.x - 1) / blockSize.x,
-        (smallHeight + blockSize.y - 1) / blockSize.y);
+    // Allocate memory
+    checkCudaErrors(cudaMalloc(&d_I_gray, width * height * sizeof(double)));
+    checkCudaErrors(cudaMalloc(&d_mean_I, width * height * sizeof(double)));
+    checkCudaErrors(cudaMalloc(&d_mean_p, width * height * sizeof(double)));
+    checkCudaErrors(cudaMalloc(&d_mean_Ip, width * height * sizeof(double)));
+    checkCudaErrors(cudaMalloc(&d_mean_II, width * height * sizeof(double)));
+    checkCudaErrors(cudaMalloc(&d_var_I, width * height * sizeof(double)));
+    checkCudaErrors(cudaMalloc(&d_cov_Ip, width * height * sizeof(double)));
+    checkCudaErrors(cudaMalloc(&d_a, width * height * sizeof(double)));
+    checkCudaErrors(cudaMalloc(&d_b, width * height * sizeof(double)));
+    checkCudaErrors(cudaMalloc(&d_mean_a, width * height * sizeof(double)));
+    checkCudaErrors(cudaMalloc(&d_mean_b, width * height * sizeof(double)));
+    checkCudaErrors(cudaMalloc(&d_temp, width * height * sizeof(double)));
 
-    // Allocate memory for intermediate results
-    float* d_I_gray = nullptr;
-    float* d_I_small = nullptr;
-    float* d_p_small = nullptr;
-    float* d_mean_I = nullptr;
-    float* d_mean_p = nullptr;
-    float* d_mean_Ip = nullptr;
-    float* d_mean_II = nullptr;
-    float* d_var_I = nullptr;
-    float* d_cov_Ip = nullptr;
-    float* d_a = nullptr;
-    float* d_b = nullptr;
-    float* d_mean_a = nullptr;
-    float* d_mean_b = nullptr;
-    float* d_a_big = nullptr;
-    float* d_b_big = nullptr;
-    float* d_temp = nullptr;
-    float* d_sharpened = nullptr;
-
-    // Allocate device memory
-    checkCudaErrors(cudaMalloc(&d_I_gray, width * height * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_I_small, smallWidth * smallHeight * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_p_small, smallWidth * smallHeight * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_mean_I, smallWidth * smallHeight * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_mean_p, smallWidth * smallHeight * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_mean_Ip, smallWidth * smallHeight * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_mean_II, smallWidth * smallHeight * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_var_I, smallWidth * smallHeight * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_cov_Ip, smallWidth * smallHeight * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_a, smallWidth * smallHeight * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_b, smallWidth * smallHeight * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_mean_a, smallWidth * smallHeight * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_mean_b, smallWidth * smallHeight * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_a_big, width * height * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_b_big, width * height * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_temp, smallWidth * smallHeight * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_sharpened, width * height * sizeof(float)));
-
-    // Convert input image to grayscale
-    rgbToGrayKernel << <fullGridSize, blockSize >> > (d_I, d_I_gray, width, height, channels);
-    checkKernelErrors();
-
-    // Downsample grayscale image
-    downsampleKernel << <smallGridSize, blockSize >> > (d_I_gray, d_I_small, width, height, smallWidth, smallHeight);
-    checkKernelErrors();
-
-    // Downsample transmission map
-    downsampleKernel << <smallGridSize, blockSize >> > (d_p, d_p_small, width, height, smallWidth, smallHeight);
+    // Convert to grayscale
+    rgbToGrayKernel << <gridSize, blockSize >> > (d_img, d_I_gray, width, height, channels);
     checkKernelErrors();
 
     // Mean of I
-    boxFilterKernel << <smallGridSize, blockSize >> > (d_I_small, d_mean_I, smallWidth, smallHeight, r / s);
+    boxFilterKernel << <gridSize, blockSize >> > (d_I_gray, d_mean_I, width, height, r);
     checkKernelErrors();
 
-    // Mean of p
-    boxFilterKernel << <smallGridSize, blockSize >> > (d_p_small, d_mean_p, smallWidth, smallHeight, r / s);
+    // Mean of p (transmission)
+    boxFilterKernel << <gridSize, blockSize >> > (d_transmission, d_mean_p, width, height, r);
     checkKernelErrors();
 
-    // Mean of I * p
-    multiplyKernel << <smallGridSize, blockSize >> > (d_I_small, d_p_small, d_temp, smallWidth, smallHeight);
-    boxFilterKernel << <smallGridSize, blockSize >> > (d_temp, d_mean_Ip, smallWidth, smallHeight, r / s);
+    // Compute I*p
+    multiplyKernel << <gridSize, blockSize >> > (d_I_gray, d_transmission, d_temp, width, height);
     checkKernelErrors();
 
-    // Mean of I * I
-    multiplyKernel << <smallGridSize, blockSize >> > (d_I_small, d_I_small, d_temp, smallWidth, smallHeight);
-    boxFilterKernel << <smallGridSize, blockSize >> > (d_temp, d_mean_II, smallWidth, smallHeight, r / s);
+    // Mean of I*p
+    boxFilterKernel << <gridSize, blockSize >> > (d_temp, d_mean_Ip, width, height, r);
     checkKernelErrors();
 
-    // Variance of I
-    multiplyKernel << <smallGridSize, blockSize >> > (d_mean_I, d_mean_I, d_temp, smallWidth, smallHeight);
-    subtractKernel << <smallGridSize, blockSize >> > (d_mean_II, d_temp, d_var_I, smallWidth, smallHeight);
+    // Compute I*I
+    multiplyKernel << <gridSize, blockSize >> > (d_I_gray, d_I_gray, d_temp, width, height);
     checkKernelErrors();
 
-    // Covariance of I and p
-    multiplyKernel << <smallGridSize, blockSize >> > (d_mean_I, d_mean_p, d_temp, smallWidth, smallHeight);
-    subtractKernel << <smallGridSize, blockSize >> > (d_mean_Ip, d_temp, d_cov_Ip, smallWidth, smallHeight);
+    // Mean of I*I
+    boxFilterKernel << <gridSize, blockSize >> > (d_temp, d_mean_II, width, height, r);
     checkKernelErrors();
 
-    // Calculate a and b
-    // Smaller epsilon for better edge preservation
-    float adjusted_eps = eps * 0.5f;
-    divideKernel << <smallGridSize, blockSize >> > (d_cov_Ip, d_var_I, d_a, smallWidth, smallHeight, adjusted_eps);
-    multiplyKernel << <smallGridSize, blockSize >> > (d_a, d_mean_I, d_temp, smallWidth, smallHeight);
-    subtractKernel << <smallGridSize, blockSize >> > (d_mean_p, d_temp, d_b, smallWidth, smallHeight);
+    // Compute variance
+    varianceKernel << <gridSize, blockSize >> > (d_mean_II, d_mean_I, width, height);
     checkKernelErrors();
 
-    // Mean of a and b with smaller radius for better edge preservation
-    int refinement_radius = r / s - 1;
-    refinement_radius = max(1, refinement_radius);
-    boxFilterKernel << <smallGridSize, blockSize >> > (d_a, d_mean_a, smallWidth, smallHeight, refinement_radius);
-    boxFilterKernel << <smallGridSize, blockSize >> > (d_b, d_mean_b, smallWidth, smallHeight, refinement_radius);
+    // Compute covariance
+    covarianceKernel << <gridSize, blockSize >> > (d_mean_Ip, d_mean_I, d_mean_p, d_mean_Ip, width, height);
     checkKernelErrors();
 
-    // Upsample a and b to original resolution
-    upsampleKernel << <fullGridSize, blockSize >> > (d_mean_a, d_a_big, smallWidth, smallHeight, width, height);
-    upsampleKernel << <fullGridSize, blockSize >> > (d_mean_b, d_b_big, smallWidth, smallHeight, width, height);
+    // Compute a and b coefficients
+    computeCoefficientsKernel << <gridSize, blockSize >> > (d_a, d_b, d_mean_Ip, d_mean_II,
+        d_mean_I, d_mean_p, width, height, eps);
     checkKernelErrors();
 
-    // Apply filter: q = a*I + b
-    applyFilterKernel << <fullGridSize, blockSize >> > (d_a_big, d_b_big, d_output, d_I_gray, width, height);
+    // Mean of a and b
+    boxFilterKernel << <gridSize, blockSize >> > (d_a, d_mean_a, width, height, r);
+    boxFilterKernel << <gridSize, blockSize >> > (d_b, d_mean_b, width, height, r);
     checkKernelErrors();
 
-    // Apply sharpening to enhance details
-    sharpenKernel << <fullGridSize, blockSize >> > (d_output, d_sharpened, width, height, 0.3f);
+    // Final guided filter result
+    guidedFilterResultKernel << <gridSize, blockSize >> > (d_refined, d_mean_a, d_mean_b,
+        d_I_gray, width, height);
     checkKernelErrors();
 
-    // Copy sharpened result back to output
-    checkCudaErrors(cudaMemcpy(d_output, d_sharpened, width * height * sizeof(float), cudaMemcpyDeviceToDevice));
+    // Apply sky region handling
+    skyRegionHandlingKernel << <gridSize, blockSize >> > (d_refined, d_img, width, height, channels);
+    checkKernelErrors();
 
     // Free memory
     cudaFree(d_I_gray);
-    cudaFree(d_I_small);
-    cudaFree(d_p_small);
     cudaFree(d_mean_I);
     cudaFree(d_mean_p);
     cudaFree(d_mean_Ip);
@@ -578,10 +475,7 @@ void guidedFilterCuda(const unsigned char* d_I, float* d_p, float* d_output,
     cudaFree(d_b);
     cudaFree(d_mean_a);
     cudaFree(d_mean_b);
-    cudaFree(d_a_big);
-    cudaFree(d_b_big);
     cudaFree(d_temp);
-    cudaFree(d_sharpened);
 }
 
 namespace DarkChannel {
@@ -621,7 +515,7 @@ namespace DarkChannel {
         }
     }
 
-    cv::Mat dehaze_cuda(const cv::Mat& img) {
+    ImageU8 dehaze_cuda(const ImageU8& img) {
         try {
             // Reset timing info
             TimingInfo timingInfo;
@@ -640,29 +534,27 @@ namespace DarkChannel {
                 << deviceProp.major << "." << deviceProp.minor << std::endl;
 
             // Check if image is valid
-            if (img.empty() || img.type() != CV_8UC3) {
-                std::cerr << "Error: Input image is empty or not 3-channel 8-bit" << std::endl;
+            if (img.empty() || img.channels != 3) {
+                std::cerr << "Error: Input image is empty or not 3-channel" << std::endl;
                 return img;
             }
 
             // Image dimensions
-            int width = img.cols;
-            int height = img.rows;
-            int channels = img.channels();
+            int width = img.width;
+            int height = img.height;
+            int channels = img.channels;
             int imgSize = width * height;
             size_t imgBytes = imgSize * channels * sizeof(unsigned char);
 
-            std::cout << "Processing image size: " << width << "x" << height << " ("
-                << (imgBytes / (1024 * 1024)) << " MB)" << std::endl;
+            std::cout << "Processing image size: " << width << "x" << height << std::endl;
 
             // Allocate host and device memory
             unsigned char* d_img = nullptr;
-            float* d_darkChannel = nullptr;
-            float* d_transmission = nullptr;
-            float* d_refined_transmission = nullptr;
+            double* d_darkChannel = nullptr;
+            double* d_transmission = nullptr;
+            double* d_refined_transmission = nullptr;
             unsigned char* d_result = nullptr;
-            float* d_atmospheric = nullptr;
-            float* d_sharpened = nullptr;
+            double* d_atmospheric = nullptr;
 
             try {
                 // Start dark channel calculation timing
@@ -670,15 +562,15 @@ namespace DarkChannel {
 
                 // Allocate device memory
                 checkCudaErrors(cudaMalloc(&d_img, imgBytes));
-                checkCudaErrors(cudaMalloc(&d_darkChannel, imgSize * sizeof(float)));
-                checkCudaErrors(cudaMalloc(&d_sharpened, imgSize * sizeof(float)));
+                checkCudaErrors(cudaMalloc(&d_darkChannel, imgSize * sizeof(double)));
 
                 // Copy input image to device
-                checkCudaErrors(cudaMemcpy(d_img, img.data, imgBytes, cudaMemcpyHostToDevice));
+                checkCudaErrors(cudaMemcpy(d_img, img.get_data(), imgBytes, cudaMemcpyHostToDevice));
 
                 // Define block and grid dimensions - adjust for large images
                 dim3 blockSize(16, 16);
-                dim3 gridSize((width + blockSize.x - 1) / blockSize.x, (height + blockSize.y - 1) / blockSize.y);
+                dim3 gridSize((width + blockSize.x - 1) / blockSize.x,
+                    (height + blockSize.y - 1) / blockSize.y);
 
                 // Calculate shared memory size for the dark channel kernel
                 int patchRadius = 7;
@@ -687,22 +579,25 @@ namespace DarkChannel {
                 size_t sharedMemSize = sharedWidth * sharedHeight * channels * sizeof(unsigned char);
 
                 // Dark channel calculation with shared memory
-                darkChannelKernel << <gridSize, blockSize, sharedMemSize >> > (d_img, d_darkChannel, width, height, channels, patchRadius);
+                darkChannelKernel << <gridSize, blockSize, sharedMemSize >> > (
+                    d_img, d_darkChannel, width, height, channels, patchRadius);
                 checkKernelErrors();
 
                 // Copy dark channel back to host for atmospheric light estimation
-                float* h_darkChannel = new float[imgSize];
-                checkCudaErrors(cudaMemcpy(h_darkChannel, d_darkChannel, imgSize * sizeof(float), cudaMemcpyDeviceToHost));
+                double* h_darkChannel = new double[imgSize];
+                checkCudaErrors(cudaMemcpy(h_darkChannel, d_darkChannel,
+                    imgSize * sizeof(double), cudaMemcpyDeviceToHost));
 
                 // End dark channel timing
                 auto darkChannelEndTime = std::chrono::high_resolution_clock::now();
-                timingInfo.darkChannelTime = std::chrono::duration<double, std::milli>(darkChannelEndTime - darkChannelStartTime).count();
+                timingInfo.darkChannelTime = std::chrono::duration<double, std::milli>(
+                    darkChannelEndTime - darkChannelStartTime).count();
 
                 // Start atmospheric light estimation timing
                 auto atmosphericStartTime = std::chrono::high_resolution_clock::now();
 
                 // Find atmospheric light (top 0.1% brightest pixels in dark channel)
-                std::vector<std::pair<float, int>> brightnessIndices;
+                std::vector<std::pair<double, int>> brightnessIndices;
                 brightnessIndices.reserve(imgSize);
 
                 for (int i = 0; i < imgSize; i++) {
@@ -710,14 +605,14 @@ namespace DarkChannel {
                 }
 
                 std::sort(brightnessIndices.begin(), brightnessIndices.end(),
-                    [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+                    [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
                         return a.first > b.first;
                     });
 
-                // Use top 0.1% brightest pixels but add protections
+                // Use top 0.1% brightest pixels but with protection for extreme values
                 int numBrightestPixels = std::max(1, imgSize / 1000);
-                float atmospheric[3] = { 0, 0, 0 };
-                float maxAtmospheric = 0.0f;
+                double atmospheric[3] = { 0, 0, 0 };
+                double maxAtmospheric = 0.0;
                 bool validAtmospheric = false;
 
                 // First pass - find the maximum value
@@ -726,8 +621,7 @@ namespace DarkChannel {
                     int y = idx / width;
                     int x = idx % width;
 
-                    cv::Vec3b pixelValue = img.at<cv::Vec3b>(y, x);
-                    float avgIntensity = (pixelValue[0] + pixelValue[1] + pixelValue[2]) / 3.0f;
+                    double avgIntensity = (img.at(y, x, 0) + img.at(y, x, 1) + img.at(y, x, 2)) / 3.0;
 
                     if (avgIntensity > maxAtmospheric) {
                         maxAtmospheric = avgIntensity;
@@ -740,14 +634,13 @@ namespace DarkChannel {
                     int y = idx / width;
                     int x = idx % width;
 
-                    cv::Vec3b pixelValue = img.at<cv::Vec3b>(y, x);
-                    float avgIntensity = (pixelValue[0] + pixelValue[1] + pixelValue[2]) / 3.0f;
+                    double avgIntensity = (img.at(y, x, 0) + img.at(y, x, 1) + img.at(y, x, 2)) / 3.0;
 
-                    // Only use pixels that are at least 70% as bright as the brightest
-                    if (avgIntensity > maxAtmospheric * 0.7f) {
-                        atmospheric[0] += pixelValue[0] / 255.0f;  // B
-                        atmospheric[1] += pixelValue[1] / 255.0f;  // G
-                        atmospheric[2] += pixelValue[2] / 255.0f;  // R
+                    // Only use pixels that are reasonably bright
+                    if (avgIntensity > maxAtmospheric * 0.7) {
+                        atmospheric[0] += img.at(y, x, 0) / 255.0;  // B
+                        atmospheric[1] += img.at(y, x, 1) / 255.0;  // G
+                        atmospheric[2] += img.at(y, x, 2) / 255.0;  // R
                         validAtmospheric = true;
                     }
                 }
@@ -760,54 +653,66 @@ namespace DarkChannel {
                 }
                 else {
                     // Use a fallback if no good atmospheric light found
-                    atmospheric[0] = 0.8f;
-                    atmospheric[1] = 0.8f;
-                    atmospheric[2] = 0.8f;
+                    atmospheric[0] = 0.8;
+                    atmospheric[1] = 0.8;
+                    atmospheric[2] = 0.8;
                 }
 
-                // Ensure atmospheric light is not too dark - critical for hazy scenes
-                float minAtmosphericThreshold = 0.7f;
+                // Use exactly the same bounds in both serial and CUDA
                 for (int i = 0; i < 3; i++) {
-                    if (atmospheric[i] < minAtmosphericThreshold) {
-                        atmospheric[i] = minAtmosphericThreshold;
-                    }
+                    atmospheric[i] = std::max(0.05, std::min(0.95, atmospheric[i]));
+                }
+
+                // Check if this is likely an indoor scene based on atmospheric light
+                bool isIndoorScene = false;
+                double avgAtmospheric = (atmospheric[0] + atmospheric[1] + atmospheric[2]) / 3.0;
+                if (avgAtmospheric < 0.6) {
+                    isIndoorScene = true;
                 }
 
                 // End atmospheric light timing
                 auto atmosphericEndTime = std::chrono::high_resolution_clock::now();
-                timingInfo.atmosphericLightTime = std::chrono::duration<double, std::milli>(atmosphericEndTime - atmosphericStartTime).count();
+                timingInfo.atmosphericLightTime = std::chrono::duration<double, std::milli>(
+                    atmosphericEndTime - atmosphericStartTime).count();
 
                 // Start transmission estimation timing
                 auto transmissionStartTime = std::chrono::high_resolution_clock::now();
 
                 // Allocate memory for transmission map
-                checkCudaErrors(cudaMalloc(&d_transmission, imgSize * sizeof(float)));
+                checkCudaErrors(cudaMalloc(&d_transmission, imgSize * sizeof(double)));
 
                 // Copy atmospheric light to device
-                checkCudaErrors(cudaMalloc(&d_atmospheric, 3 * sizeof(float)));
-                checkCudaErrors(cudaMemcpy(d_atmospheric, atmospheric, 3 * sizeof(float), cudaMemcpyHostToDevice));
+                checkCudaErrors(cudaMalloc(&d_atmospheric, 3 * sizeof(double)));
+                checkCudaErrors(cudaMemcpy(d_atmospheric, atmospheric,
+                    3 * sizeof(double), cudaMemcpyHostToDevice));
 
-                // Estimate transmission using dark channel prior with a conservative omega
-                float omega = 0.75f;  // Less aggressive to preserve natural look
-                transmissionKernel << <gridSize, blockSize >> > (d_img, d_atmospheric, d_transmission, width, height, channels, patchRadius, omega);
+                // Adjust omega for indoor scenes - same as serial
+                double omega = isIndoorScene ? 0.75 : 0.95;
+
+                // Estimate transmission using dark channel prior
+                transmissionKernel << <gridSize, blockSize >> > (
+                    d_img, d_atmospheric, d_transmission, width, height, channels, patchRadius, omega);
                 checkKernelErrors();
 
                 // End transmission timing
                 auto transmissionEndTime = std::chrono::high_resolution_clock::now();
-                timingInfo.transmissionTime = std::chrono::duration<double, std::milli>(transmissionEndTime - transmissionStartTime).count();
+                timingInfo.transmissionTime = std::chrono::duration<double, std::milli>(
+                    transmissionEndTime - transmissionStartTime).count();
 
                 // Start refinement timing
                 auto refinementStartTime = std::chrono::high_resolution_clock::now();
 
                 // Allocate memory for refined transmission
-                checkCudaErrors(cudaMalloc(&d_refined_transmission, imgSize * sizeof(float)));
+                checkCudaErrors(cudaMalloc(&d_refined_transmission, imgSize * sizeof(double)));
 
-                // Apply guided filter with improved edge preservation
-                guidedFilterCuda(d_img, d_transmission, d_refined_transmission, width, height, channels, 30, 0.05f, 2);  // Smaller radius and epsilon for better detail
+                // Apply guided filter refinement using double precision implementation
+                // Use the same parameters as serial implementation (radius 40, epsilon 0.1, subsample factor 4)
+                guidedFilterCuda(d_img, d_transmission, d_refined_transmission, width, height, channels, 40, 0.1);
 
                 // End refinement timing
                 auto refinementEndTime = std::chrono::high_resolution_clock::now();
-                timingInfo.refinementTime = std::chrono::duration<double, std::milli>(refinementEndTime - refinementStartTime).count();
+                timingInfo.refinementTime = std::chrono::duration<double, std::milli>(
+                    refinementEndTime - refinementStartTime).count();
 
                 // Start scene reconstruction timing
                 auto reconstructionStartTime = std::chrono::high_resolution_clock::now();
@@ -815,22 +720,28 @@ namespace DarkChannel {
                 // Allocate memory for result
                 checkCudaErrors(cudaMalloc(&d_result, imgBytes));
 
+                // Adjust minimum transmission value for indoor scenes - same as serial
+                double t0 = isIndoorScene ? 0.2 : 0.1;
+
                 // Recover scene with enhanced quality and adaptive parameters
-                float t0 = 0.1f;  // Minimum transmission value
-                sceneRecoveryKernel << <gridSize, blockSize >> > (d_img, d_refined_transmission, d_atmospheric, d_result, width, height, channels, t0);
+                sceneRecoveryKernel << <gridSize, blockSize >> > (
+                    d_img, d_refined_transmission, d_atmospheric, d_result, width, height, channels, t0);
                 checkKernelErrors();
 
                 // Copy result back to host
-                cv::Mat result(height, width, CV_8UC3);
-                checkCudaErrors(cudaMemcpy(result.data, d_result, imgBytes, cudaMemcpyDeviceToHost));
+                ImageU8 result(width, height, channels);
+                checkCudaErrors(cudaMemcpy(result.get_data(), d_result,
+                    imgBytes, cudaMemcpyDeviceToHost));
 
                 // End scene reconstruction timing
                 auto reconstructionEndTime = std::chrono::high_resolution_clock::now();
-                timingInfo.reconstructionTime = std::chrono::duration<double, std::milli>(reconstructionEndTime - reconstructionStartTime).count();
+                timingInfo.reconstructionTime = std::chrono::duration<double, std::milli>(
+                    reconstructionEndTime - reconstructionStartTime).count();
 
                 // End total time measurement
                 auto totalEndTime = std::chrono::high_resolution_clock::now();
-                timingInfo.totalTime = std::chrono::duration<double, std::milli>(totalEndTime - totalStartTime).count();
+                timingInfo.totalTime = std::chrono::duration<double, std::milli>(
+                    totalEndTime - totalStartTime).count();
 
                 std::cout << "\n===== CUDA Performance Timing (milliseconds) =====" << std::endl;
                 std::cout << std::fixed << std::setprecision(10);
@@ -845,46 +756,6 @@ namespace DarkChannel {
                 // Save timing info in the global variable for access
                 lastTimingInfo = timingInfo;
 
-                // Apply post-processing for better visual quality and sharpness
-                cv::Mat enhancedResult;
-                result.convertTo(enhancedResult, CV_32F, 1.0 / 255.0);
-
-                // Sharpen the image using unsharp mask
-                cv::Mat blurred;
-                cv::GaussianBlur(enhancedResult, blurred, cv::Size(0, 0), 1.5);
-                cv::Mat unsharpMask = enhancedResult - blurred;
-                enhancedResult = enhancedResult + 0.7 * unsharpMask;  // Adjust strength as needed
-
-                // Apply adaptive contrast enhancement
-                cv::Scalar meanValue = cv::mean(enhancedResult);
-                float meanIntensity = (meanValue[0] + meanValue[1] + meanValue[2]) / 3.0f;
-
-                // Adjust brightness if image is too dark
-                if (meanIntensity < 0.4f) {
-                    float brightnessAdjust = 0.4f / meanIntensity;
-                    brightnessAdjust = std::min(brightnessAdjust, 1.5f);  // Limit adjustment
-                    enhancedResult = enhancedResult * brightnessAdjust;
-                }
-
-                // Apply additional contrast enhancement
-                cv::Mat contrastEnhanced;
-                enhancedResult.convertTo(contrastEnhanced, -1, 1.1, 0.05);  // Increase contrast slightly
-
-                // Apply detail-preserving bilateral filter to reduce noise while keeping edges sharp
-                cv::Mat bilateralFiltered;
-                cv::bilateralFilter(contrastEnhanced, bilateralFiltered, 5, 10, 10);
-
-                // Apply final sharpening pass
-                cv::Mat sharpened;
-                cv::Mat kernel = (cv::Mat_<float>(3, 3) <<
-                    0, -0.5, 0,
-                    -0.5, 3, -0.5,
-                    0, -0.5, 0);
-                cv::filter2D(bilateralFiltered, sharpened, -1, kernel);
-
-                // Convert back to 8-bit for output
-                sharpened.convertTo(result, CV_8UC3, 255.0);
-
                 // Cleanup
                 delete[] h_darkChannel;
                 cudaFree(d_img);
@@ -893,7 +764,6 @@ namespace DarkChannel {
                 cudaFree(d_refined_transmission);
                 cudaFree(d_atmospheric);
                 cudaFree(d_result);
-                cudaFree(d_sharpened);
 
                 return result;
             }
@@ -907,18 +777,13 @@ namespace DarkChannel {
                 if (d_refined_transmission) cudaFree(d_refined_transmission);
                 if (d_atmospheric) cudaFree(d_atmospheric);
                 if (d_result) cudaFree(d_result);
-                if (d_sharpened) cudaFree(d_sharpened);
 
                 std::cerr << "Falling back to CPU implementation." << std::endl;
                 return dehaze(img);
             }
         }
-        catch (const cv::Exception& e) {
-            std::cerr << "OpenCV Exception in CUDA implementation: " << e.what() << std::endl;
-            return img;
-        }
         catch (const std::exception& e) {
-            std::cerr << "Standard Exception in CUDA implementation: " << e.what() << std::endl;
+            std::cerr << "Exception in CUDA implementation: " << e.what() << std::endl;
             return img;
         }
         catch (...) {

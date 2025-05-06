@@ -1,15 +1,16 @@
-#pragma once
-#ifndef DEHAZE_PARALLEL_H
-#define DEHAZE_PARALLEL_H
+//#pragma once
+//#ifndef DEHAZE_PARALLEL_H
+//#define DEHAZE_PARALLEL_H
 
-#include <opencv2/opencv.hpp>
+//#include "custom_types.h"
 
-namespace DarkChannel {
+/*namespace DarkChannel {
     // Non-threaded OpenMP - using vectorization
-    cv::Mat dehazeParallel(const cv::Mat& img, int numThreads = 1);
+    ImageU8 dehazeParallel(const ImageU8& img, int numThreads = 1);
 
     // Check CUDA availability
     bool isCudaAvailable();
 }
 
-#endif // DEHAZE_PARALLEL_H
+#endif
+*/
