@@ -309,19 +309,19 @@ __global__ void skyRegionHandlingKernel(double* transmission, const unsigned cha
 
     if (x >= width || y >= height) return;
 
-    // Only process top third of image (matching serial implementation)
+    // Only process top third of image (matching serial/OpenMP implementation)
     if (y < height / 3) {
         int rgbIdx = (y * width + x) * channels;
         double b = imgData[rgbIdx] / 255.0;       // Blue value
         double g = imgData[rgbIdx + 1] / 255.0;   // Green value
         double r = imgData[rgbIdx + 2] / 255.0;   // Red value
 
-        // Match the same sky detection criteria as in serial implementation
+        // Match the same sky detection criteria as in serial/OpenMP implementation
         if ((b > 0.6 && b > r && b > g) || // Blue-dominant sky
             (b > 0.6 && g > 0.6 && r > 0.6)) { // Bright sky (any color)
 
             int idx = y * width + x;
-            // Use same transmission value threshold as serial implementation
+            // Use same transmission value threshold as serial/OpenMP implementation
             transmission[idx] = fmax(transmission[idx], 0.7);
         }
     }

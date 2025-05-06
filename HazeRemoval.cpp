@@ -15,7 +15,65 @@ namespace DarkChannel {
         return lastTimingInfo;
     }
 
-    cv::Mat dehaze(const cv::Mat& img) {
+    // Convert OpenCV Mat to custom image format (only for IO purposes)
+    ImageU8 matToImage(const cv::Mat& mat) {
+        if (mat.empty()) {
+            return ImageU8();
+        }
+
+        int width = mat.cols;
+        int height = mat.rows;
+        int channels = mat.channels();
+
+        ImageU8 result(width, height, channels);
+
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                if (channels == 1) {
+                    result.at(y, x, 0) = mat.at<unsigned char>(y, x);
+                }
+                else if (channels == 3) {
+                    const cv::Vec3b& pixel = mat.at<cv::Vec3b>(y, x);
+                    result.at(y, x, 0) = pixel[0]; // B
+                    result.at(y, x, 1) = pixel[1]; // G
+                    result.at(y, x, 2) = pixel[2]; // R
+                }
+            }
+        }
+        return result;
+    }
+
+    // Convert custom image format back to OpenCV Mat (only for IO purposes)
+    cv::Mat imageToMat(const ImageU8& img) {
+        if (img.empty()) {
+            return cv::Mat();
+        }
+
+        cv::Mat result;
+        if (img.channels == 1) {
+            result = cv::Mat(img.height, img.width, CV_8UC1);
+            for (int y = 0; y < img.height; y++) {
+                for (int x = 0; x < img.width; x++) {
+                    result.at<unsigned char>(y, x) = img.at(y, x, 0);
+                }
+            }
+        }
+        else if (img.channels == 3) {
+            result = cv::Mat(img.height, img.width, CV_8UC3);
+            for (int y = 0; y < img.height; y++) {
+                for (int x = 0; x < img.width; x++) {
+                    cv::Vec3b& pixel = result.at<cv::Vec3b>(y, x);
+                    pixel[0] = img.at(y, x, 0); // B
+                    pixel[1] = img.at(y, x, 1); // G
+                    pixel[2] = img.at(y, x, 2); // R
+                }
+            }
+        }
+        return result;
+    }
+
+    // Serial implementation
+    ImageU8 dehaze(const ImageU8& img) {
         try {
             // Reset timing info
             lastTimingInfo = TimingInfo();
@@ -30,57 +88,64 @@ namespace DarkChannel {
             }
 
             // Check for correct image type
-            __Assert__(img.type() == CV_8UC3, "3 channel images only.");
+            if (img.channels != 3) {
+                std::cerr << "Error: Only 3-channel images are supported" << std::endl;
+                return img;
+            }
 
             // Convert to double precision for calculations
-            cv::Mat img_double;
-            img.convertTo(img_double, CV_64FC3);
-            img_double /= 255;
+            ImageF64 img_double = img.convertTo<double>(1.0 / 255.0);
 
             // Start timing for dark channel calculation
             auto darkChannelStartTime = std::chrono::high_resolution_clock::now();
 
             // Get dark channel
-            int patch_radius = 7;
-            cv::Mat darkchannel = cv::Mat::zeros(img_double.rows, img_double.cols, CV_64F);
-            for (int i = 0; i < darkchannel.rows; i++) {
-                for (int j = 0; j < darkchannel.cols; j++) {
+            int patch_radius = 7; // Consistent patch radius across all implementations
+            ImageF64 darkchannel = zeros<double>(img_double.width, img_double.height);
+
+            for (int i = 0; i < darkchannel.height; i++) {
+                for (int j = 0; j < darkchannel.width; j++) {
                     int r_start = std::max(0, i - patch_radius);
-                    int r_end = std::min(darkchannel.rows, i + patch_radius + 1);
+                    int r_end = std::min(darkchannel.height, i + patch_radius + 1);
                     int c_start = std::max(0, j - patch_radius);
-                    int c_end = std::min(darkchannel.cols, j + patch_radius + 1);
+                    int c_end = std::min(darkchannel.width, j + patch_radius + 1);
                     double dark = 1.0;  // Initialize to max normalized value (1.0)
+
                     for (int r = r_start; r < r_end; r++) {
                         for (int c = c_start; c < c_end; c++) {
-                            const cv::Vec3d& val = img_double.at<cv::Vec3d>(r, c);
-                            dark = std::min(dark, val[0]);
-                            dark = std::min(dark, val[1]);
-                            dark = std::min(dark, val[2]);
+                            double val0 = img_double.at(r, c, 0); // B
+                            double val1 = img_double.at(r, c, 1); // G
+                            double val2 = img_double.at(r, c, 2); // R
+
+                            dark = std::min(dark, val0);
+                            dark = std::min(dark, val1);
+                            dark = std::min(dark, val2);
                         }
                     }
-                    darkchannel.at<double>(i, j) = dark;
+
+                    darkchannel.at(i, j) = dark;
                 }
             }
 
             // End timing for dark channel calculation
             auto darkChannelEndTime = std::chrono::high_resolution_clock::now();
-            lastTimingInfo.darkChannelTime = std::chrono::duration<double, std::milli>(darkChannelEndTime - darkChannelStartTime).count();
+            lastTimingInfo.darkChannelTime = std::chrono::duration<double, std::milli>(
+                darkChannelEndTime - darkChannelStartTime).count();
 
             // Start timing for atmospheric light estimation
             auto atmosphericStartTime = std::chrono::high_resolution_clock::now();
 
             // Get atmospheric light
-            int pixels = img_double.rows * img_double.cols;
+            int pixels = img_double.height * img_double.width;
             // Ensure at least 1 pixel is used
             int num = std::max(1, pixels / 1000); // 0.1% brightest pixels
             std::vector<std::pair<double, int>> V;
             V.reserve(pixels);
 
-            int k = 0;
-            for (int i = 0; i < darkchannel.rows; i++) {
-                for (int j = 0; j < darkchannel.cols; j++) {
-                    V.emplace_back(darkchannel.at<double>(i, j), k);
-                    k++;
+            for (int i = 0; i < darkchannel.height; i++) {
+                for (int j = 0; j < darkchannel.width; j++) {
+                    int index = i * darkchannel.width + j;
+                    V.emplace_back(darkchannel.at(i, j), index);
                 }
             }
 
@@ -90,12 +155,14 @@ namespace DarkChannel {
 
             double atmospheric_light[3] = { 0, 0, 0 };
             double maxAtmospheric = 0.0;
-            for (k = 0; k < num; k++) {
-                int r = V[k].second / darkchannel.cols;
-                int c = V[k].second % darkchannel.cols;
-                const cv::Vec3d& val = img_double.at<cv::Vec3d>(r, c);
 
-                double avgIntensity = (val[0] + val[1] + val[2]) / 3.0;
+            // First pass - find maximum intensity
+            for (int k = 0; k < num; k++) {
+                int idx = V[k].second;
+                int y = idx / darkchannel.width;
+                int x = idx % darkchannel.width;
+
+                double avgIntensity = (img_double.at(y, x, 0) + img_double.at(y, x, 1) + img_double.at(y, x, 2)) / 3.0;
                 if (avgIntensity > maxAtmospheric) {
                     maxAtmospheric = avgIntensity;
                 }
@@ -103,16 +170,16 @@ namespace DarkChannel {
 
             // Second pass - use only reasonably bright pixels
             int validPixels = 0;
-            for (k = 0; k < num; k++) {
-                int r = V[k].second / darkchannel.cols;
-                int c = V[k].second % darkchannel.cols;
-                const cv::Vec3d& val = img_double.at<cv::Vec3d>(r, c);
+            for (int k = 0; k < num; k++) {
+                int idx = V[k].second;
+                int y = idx / darkchannel.width;
+                int x = idx % darkchannel.width;
 
-                double avgIntensity = (val[0] + val[1] + val[2]) / 3.0;
-                if (avgIntensity > maxAtmospheric * 0.7) {
-                    atmospheric_light[0] += val[0];
-                    atmospheric_light[1] += val[1];
-                    atmospheric_light[2] += val[2];
+                double avgIntensity = (img_double.at(y, x, 0) + img_double.at(y, x, 1) + img_double.at(y, x, 2)) / 3.0;
+                if (avgIntensity > maxAtmospheric * 0.7) { // Consistent threshold across implementations
+                    atmospheric_light[0] += img_double.at(y, x, 0);
+                    atmospheric_light[1] += img_double.at(y, x, 1);
+                    atmospheric_light[2] += img_double.at(y, x, 2);
                     validPixels++;
                 }
             }
@@ -134,7 +201,7 @@ namespace DarkChannel {
                 atmospheric_light[i] = std::max(0.05, std::min(0.95, atmospheric_light[i]));
             }
 
-            // Check if this is likely an indoor scene
+            // Check if this is likely an indoor scene (consistent threshold)
             bool isIndoorScene = false;
             double avgAtmospheric = (atmospheric_light[0] + atmospheric_light[1] + atmospheric_light[2]) / 3.0;
             if (avgAtmospheric < 0.6) {
@@ -143,176 +210,176 @@ namespace DarkChannel {
 
             // End timing for atmospheric light estimation
             auto atmosphericEndTime = std::chrono::high_resolution_clock::now();
-            lastTimingInfo.atmosphericLightTime = std::chrono::duration<double, std::milli>(atmosphericEndTime - atmosphericStartTime).count();
+            lastTimingInfo.atmosphericLightTime = std::chrono::duration<double, std::milli>(
+                atmosphericEndTime - atmosphericStartTime).count();
 
             // Start timing for transmission estimation
             auto transmissionStartTime = std::chrono::high_resolution_clock::now();
 
             // Adjust omega for indoor/outdoor scenes
-            double omega = isIndoorScene ? 0.75 : 0.95;
-            cv::Mat channels[3];
-            cv::split(img_double, channels);
-            for (k = 0; k < 3; k++) {
-                channels[k] /= atmospheric_light[k];
+            double omega = isIndoorScene ? 0.75 : 0.95; // Consistent omega values
+
+            ImageF64 channels[3];
+            split(img_double, channels, 3);
+
+            for (int k = 0; k < 3; k++) {
+                for (int i = 0; i < channels[k].height; i++) {
+                    for (int j = 0; j < channels[k].width; j++) {
+                        channels[k].at(i, j) /= atmospheric_light[k];
+                    }
+                }
             }
 
-            cv::Mat temp;
-            cv::merge(channels, 3, temp);
+            ImageF64 temp;
+            merge(channels, 3, temp);
 
             // Get dark channel of normalized image
-            cv::Mat temp_dark = cv::Mat::zeros(temp.rows, temp.cols, CV_64F);
-            for (int i = 0; i < temp.rows; i++) {
-                for (int j = 0; j < temp.cols; j++) {
+            ImageF64 temp_dark = zeros<double>(temp.width, temp.height);
+
+            for (int i = 0; i < temp.height; i++) {
+                for (int j = 0; j < temp.width; j++) {
                     int r_start = std::max(0, i - patch_radius);
-                    int r_end = std::min(temp.rows, i + patch_radius + 1);
+                    int r_end = std::min(temp.height, i + patch_radius + 1);
                     int c_start = std::max(0, j - patch_radius);
-                    int c_end = std::min(temp.cols, j + patch_radius + 1);
+                    int c_end = std::min(temp.width, j + patch_radius + 1);
                     double dark = 1.0;
+
                     for (int r = r_start; r < r_end; r++) {
                         for (int c = c_start; c < c_end; c++) {
-                            const cv::Vec3d& val = temp.at<cv::Vec3d>(r, c);
-                            dark = std::min(dark, val[0]);
-                            dark = std::min(dark, val[1]);
-                            dark = std::min(dark, val[2]);
+                            double val0 = temp.at(r, c, 0);
+                            double val1 = temp.at(r, c, 1);
+                            double val2 = temp.at(r, c, 2);
+
+                            dark = std::min(dark, val0);
+                            dark = std::min(dark, val1);
+                            dark = std::min(dark, val2);
                         }
                     }
-                    temp_dark.at<double>(i, j) = dark;
+
+                    temp_dark.at(i, j) = dark;
                 }
             }
 
             // Get transmission
-            cv::Mat transmission = 1.0 - omega * temp_dark;
+            ImageF64 transmission(temp_dark.width, temp_dark.height, 1);
+
+            for (int i = 0; i < transmission.height; i++) {
+                for (int j = 0; j < transmission.width; j++) {
+                    transmission.at(i, j) = 1.0 - omega * temp_dark.at(i, j);
+                }
+            }
 
             // End timing for transmission estimation
             auto transmissionEndTime = std::chrono::high_resolution_clock::now();
-            lastTimingInfo.transmissionTime = std::chrono::duration<double, std::milli>(transmissionEndTime - transmissionStartTime).count();
+            lastTimingInfo.transmissionTime = std::chrono::duration<double, std::milli>(
+                transmissionEndTime - transmissionStartTime).count();
 
             // Start timing for refinement
             auto refinementStartTime = std::chrono::high_resolution_clock::now();
 
-            // Apply guided filter for refinement - use consistent parameters
+            // Apply guided filter for refinement - use consistent parameters across implementations
             transmission = fastGuidedFilter(img_double, transmission, 40, 0.1, 4);
 
             // End timing for refinement
             auto refinementEndTime = std::chrono::high_resolution_clock::now();
-            lastTimingInfo.refinementTime = std::chrono::duration<double, std::milli>(refinementEndTime - refinementStartTime).count();
+            lastTimingInfo.refinementTime = std::chrono::duration<double, std::milli>(
+                refinementEndTime - refinementStartTime).count();
 
             // Start timing for scene reconstruction
             auto reconstructionStartTime = std::chrono::high_resolution_clock::now();
 
-            // Adjust minimum transmission value based on scene type
+            // Adjust minimum transmission value based on scene type (consistent across implementations)
             double t0 = isIndoorScene ? 0.2 : 0.1;
 
             // Get a fresh copy of channels
-            cv::split(img_double, channels);
+            split(img_double, channels, 3);
 
             // Create bounded transmission map with better sky region handling
-            cv::Mat trans_ = cv::Mat(transmission.size(), CV_64F);
-            for (int i = 0; i < transmission.rows; i++) {
-                for (int j = 0; j < transmission.cols; j++) {
+            ImageF64 trans_bounded(transmission.width, transmission.height, 1);
+
+            for (int i = 0; i < transmission.height; i++) {
+                for (int j = 0; j < transmission.width; j++) {
                     // Apply minimum transmission threshold
-                    trans_.at<double>(i, j) = std::max(transmission.at<double>(i, j), t0);
+                    trans_bounded.at(i, j) = std::max(transmission.at(i, j), t0);
 
                     // Special handling for sky regions (typically in top portion of image)
-                    if (i < transmission.rows / 2) {
+                    if (i < transmission.height / 3) {
                         // Get color info to detect sky
-                        const cv::Vec3d& val = img_double.at<cv::Vec3d>(i, j);
-                        double b = val[0]; // Blue
-                        double g = val[1]; // Green
-                        double r = val[2]; // Red
+                        double b = img_double.at(i, j, 0); // Blue
+                        double g = img_double.at(i, j, 1); // Green
+                        double r = img_double.at(i, j, 2); // Red
 
-                        // Improved sky detection
-                        if (b > 0.5 || (b > 0.4 && g > 0.4 && r > 0.4)) {
+                        // Improved sky detection - consistent across implementations
+                        if ((b > 0.6 && b > r && b > g) ||      // Blue-dominant sky
+                            (b > 0.6 && g > 0.6 && r > 0.6)) {  // Bright sky (any color)
                             // Use higher transmission for sky
-                            trans_.at<double>(i, j) = 0.95;
-
-                            // Special handling for horizon/upper sky
-                            if (i < transmission.rows / 6) {
-                                trans_.at<double>(i, j) = 0.99;
-                            }
+                            trans_bounded.at(i, j) = std::max(trans_bounded.at(i, j), 0.7);
                         }
-                    }
-
-                    // Special handling for very dark regions
-                    if (darkchannel.at<double>(i, j) < 0.02) {
-                        trans_.at<double>(i, j) = std::max(trans_.at<double>(i, j), 0.4);
                     }
                 }
             }
 
-            // Process each channel with improved scene reconstruction
-            cv::Mat result_channels[3];
-            for (int c = 0; c < 3; c++) {
-                result_channels[c] = cv::Mat(img_double.size().height, img_double.size().width, CV_64F);
-            }
+            // Create result image
+            ImageF64 result(img_double.width, img_double.height, img_double.channels);
 
             // Recover the scene
-            for (int i = 0; i < img_double.rows; i++) {
-                for (int j = 0; j < img_double.cols; j++) {
-                    double t = trans_.at<double>(i, j);
+            for (int i = 0; i < img_double.height; i++) {
+                for (int j = 0; j < img_double.width; j++) {
+                    double t = trans_bounded.at(i, j);
 
-                    // Process each channel with the dehaze formula
+                    // Calculate temporary storage for color values
+                    double recovered[3];
+                    double lum = 0.0;
+
+                    // Process each channel
                     for (int c = 0; c < 3; c++) {
-                        double val = img_double.at<cv::Vec3d>(i, j)[c];
-                        double A = atmospheric_light[c];
+                        double normalized = img_double.at(i, j, c);
+                        // Apply dehaze formula J = (I-A)/t + A with bounds checking
+                        recovered[c] = ((normalized - atmospheric_light[c]) / t) + atmospheric_light[c];
 
-                        // Apply recovery formula with improved stability
-                        double recovered = ((val - A) / t) + A;
-                        recovered = std::max(0.0, std::min(1.0, recovered));
-
-                        result_channels[c].at<double>(i, j) = recovered;
+                        // Calculate luminance for saturation correction
+                        if (c == 0) lum += 0.114 * recovered[c];      // B
+                        else if (c == 1) lum += 0.587 * recovered[c]; // G
+                        else lum += 0.299 * recovered[c];             // R
                     }
-                }
-            }
 
-            // Merge channels
-            cv::Mat res;
-            cv::merge(result_channels, 3, res);
-
-            // Apply final color adjustment and tone mapping
-            for (int i = 0; i < res.rows; i++) {
-                for (int j = 0; j < res.cols; j++) {
-                    cv::Vec3d& val = res.at<cv::Vec3d>(i, j);
-
-                    // Calculate luminance for adjustment
-                    double lum = 0.299 * val[2] + 0.587 * val[1] + 0.114 * val[0];
-
-                    // Apply mild saturation correction for extreme values
+                    // Apply consistent saturation/color correction across all implementations
                     for (int c = 0; c < 3; c++) {
-                        if (val[c] > 0.8 || val[c] < 0.2) {
-                            val[c] = val[c] * 0.85 + lum * 0.15;
+                        // Apply correction for extreme values to reduce artifacts
+                        if (recovered[c] > 0.8 || recovered[c] < 0.2) {
+                            recovered[c] = recovered[c] * 0.85 + lum * 0.15;
                         }
 
-                        // Apply brightness adjustment based on scene type
+                        // Apply consistent brightness adjustments based on scene type
                         if (lum < 0.5) {
-                            // Brighten darker scenes
-                            val[c] = std::pow(val[c], 0.9);
+                            // For darker scenes (like indoor scenes), slightly increase brightness
+                            recovered[c] = pow(recovered[c], 0.9);
                         }
                         else {
-                            // Slightly reduce brightness in bright scenes
-                            val[c] = std::pow(val[c], 1.05);
+                            // For brighter scenes, keep as is or slightly reduce brightness
+                            recovered[c] = pow(recovered[c], 1.05);
                         }
 
-                        // Final bounds check
-                        val[c] = std::max(0.0, std::min(1.0, val[c]));
+                        // Ensure bounds and store
+                        result.at(i, j, c) = std::max(0.0, std::min(1.0, recovered[c]));
                     }
                 }
             }
 
-            // Convert back to 8-bit format
-            res *= 255.0;
-            cv::Mat result;
-            res.convertTo(result, CV_8UC3);
+            // Convert back to 8-bit
+            ImageU8 result_8bit = result.convertTo<unsigned char>(255.0);
 
             // End timing for scene reconstruction
             auto reconstructionEndTime = std::chrono::high_resolution_clock::now();
-            lastTimingInfo.reconstructionTime = std::chrono::duration<double, std::milli>(reconstructionEndTime - reconstructionStartTime).count();
+            lastTimingInfo.reconstructionTime = std::chrono::duration<double, std::milli>(
+                reconstructionEndTime - reconstructionStartTime).count();
 
             // End total time measurement
             auto totalEndTime = std::chrono::high_resolution_clock::now();
-            lastTimingInfo.totalTime = std::chrono::duration<double, std::milli>(totalEndTime - totalStartTime).count();
+            lastTimingInfo.totalTime = std::chrono::duration<double, std::milli>(
+                totalEndTime - totalStartTime).count();
 
-            std::cout << "\n===== Performance Timing (milliseconds) =====" << std::endl;
+            std::cout << "\n===== Serial Performance Timing (milliseconds) =====" << std::endl;
             std::cout << std::fixed << std::setprecision(10);
             std::cout << "Dark Channel Calculation: " << lastTimingInfo.darkChannelTime << " ms" << std::endl;
             std::cout << "Atmospheric Light Estimation: " << lastTimingInfo.atmosphericLightTime << " ms" << std::endl;
@@ -322,14 +389,10 @@ namespace DarkChannel {
             std::cout << "Total Execution Time: " << lastTimingInfo.totalTime << " ms" << std::endl;
             std::cout << "========================================" << std::endl;
 
-            return result;
-        }
-        catch (const cv::Exception& e) {
-            std::cerr << "OpenCV Exception: " << e.what() << std::endl;
-            return img;
+            return result_8bit;
         }
         catch (const std::exception& e) {
-            std::cerr << "Standard Exception: " << e.what() << std::endl;
+            std::cerr << "Exception in serial implementation: " << e.what() << std::endl;
             return img;
         }
         catch (...) {
