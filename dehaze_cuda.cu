@@ -308,38 +308,7 @@ __global__ void guidedFilterResultKernel(double* refined, const double* mean_a, 
     refined[idx] = fmax(0.0, fmin(1.0, refined[idx]));
 }
 
-// Special handling for sky regions (usually top of image)
-__global__ void skyRegionHandlingKernel(double* transmission, const unsigned char* imgData,
-    int width, int height, int channels) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (x >= width || y >= height) return;
-
-    // Only process top third of image (matching serial/OpenMP implementation)
-    int skyHeight = height / SKY_REGION_HEIGHT_RATIO;
-    if (y < skyHeight) {
-        int rgbIdx = (y * width + x) * channels;
-        double b = imgData[rgbIdx] / 255.0;       // Blue value
-        double g = imgData[rgbIdx + 1] / 255.0;   // Green value
-        double r = imgData[rgbIdx + 2] / 255.0;   // Red value
-
-        // Match the same sky detection criteria as in serial/OpenMP implementation
-        bool isSky = false;
-        if (b > BLUE_THRESHOLD && b > r && b > g) {          // Blue-dominant sky
-            isSky = true;
-        }
-        if (b > BRIGHT_THRESHOLD && g > BRIGHT_THRESHOLD && r > BRIGHT_THRESHOLD) {  // Bright sky (any color)
-            isSky = true;
-        }
-
-        if (isSky) {
-            int idx = y * width + x;
-            // Use same transmission value threshold as serial/OpenMP implementation
-            transmission[idx] = fmax(transmission[idx], SKY_TRANSMISSION_MIN);
-        }
-    }
-}
+// REMOVED: Special handling for sky regions (skyRegionHandlingKernel)
 
 // Enhanced scene recovery with better quality and double precision
 __global__ void sceneRecoveryKernel(const unsigned char* imgData, const double* transmission,
@@ -473,9 +442,7 @@ void guidedFilterCuda(const unsigned char* d_img, double* d_transmission, double
         d_I_gray, width, height);
     checkKernelErrors();
 
-    // Apply sky region handling
-    skyRegionHandlingKernel << <gridSize, blockSize >> > (d_refined, d_img, width, height, channels);
-    checkKernelErrors();
+    // REMOVED: Apply sky region handling - This call has been removed
 
     // Free memory
     cudaFree(d_I_gray);
@@ -671,7 +638,8 @@ namespace DarkChannel {
 
                 // Apply consistent bounds
                 for (int i = 0; i < 3; i++) {
-                    atmospheric[i] = std::max(ATMOSPHERIC_LIGHT_MIN, std::min(ATMOSPHERIC_LIGHT_MAX, atmospheric[i]));
+                    atmospheric[i] = std::max(ATMOSPHERIC_LIGHT_MIN + 0.01,
+                        std::min(ATMOSPHERIC_LIGHT_MAX - 0.01, atmospheric[i]));
                 }
 
                 // Check if this is likely an indoor scene using same threshold as CPU
@@ -720,10 +688,7 @@ namespace DarkChannel {
                 guidedFilterCuda(d_img, d_transmission, d_refined_transmission, width, height, channels,
                     GUIDED_FILTER_RADIUS, GUIDED_FILTER_EPSILON);
 
-                // Apply sky region handling - same as CPU versions
-                skyRegionHandlingKernel << <gridSize, blockSize >> > (
-                    d_refined_transmission, d_img, width, height, channels);
-                checkKernelErrors();
+                // REMOVED: Apply sky region handling - This call has been removed
 
                 // End refinement timing
                 auto refinementEndTime = std::chrono::high_resolution_clock::now();

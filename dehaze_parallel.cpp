@@ -147,9 +147,10 @@ namespace DarkChannel {
                 atmospheric_light[2] = 0.8;
             }
 
-            // Use consistent bounds for atmospheric light values
+            // Use improved bounds for atmospheric light values
             for (int i = 0; i < 3; i++) {
-                atmospheric_light[i] = std::max(ATMOSPHERIC_LIGHT_MIN, std::min(ATMOSPHERIC_LIGHT_MAX, atmospheric_light[i]));
+                atmospheric_light[i] = std::max(ATMOSPHERIC_LIGHT_MIN + 0.01,
+                    std::min(ATMOSPHERIC_LIGHT_MAX - 0.01, atmospheric_light[i]));
             }
 
             // Check if this is likely an indoor scene - consistent threshold with serial and CUDA
@@ -226,6 +227,8 @@ namespace DarkChannel {
             for (int i = 0; i < transmission.height; i++) {
                 for (int j = 0; j < transmission.width; j++) {
                     transmission.at(i, j) = 1.0 - omega * temp_dark.at(i, j);
+                    // Add explicit clamping to transmission values
+                    transmission.at(i, j) = std::max(0.01, std::min(1.0, transmission.at(i, j)));
                 }
             }
 
@@ -247,36 +250,15 @@ namespace DarkChannel {
                 GUIDED_FILTER_EPSILON,
                 GUIDED_FILTER_SUBSAMPLE);
 
-            // Apply sky region handling - consistent across all implementations
-            int skyRegionHeight = transmission.height / SKY_REGION_HEIGHT_RATIO;
-
+            // Another clamping after refinement
 #pragma omp parallel for collapse(2)
-            for (int i = 0; i < skyRegionHeight; i++) {
+            for (int i = 0; i < transmission.height; i++) {
                 for (int j = 0; j < transmission.width; j++) {
-                    // Get color info to detect sky
-                    double b = img_double.at(i, j, 0); // Blue
-                    double g = img_double.at(i, j, 1); // Green
-                    double r = img_double.at(i, j, 2); // Red
-
-                    // Sky detection using consistent criteria
-                    bool isSky = false;
-
-                    // Blue-dominant sky detection
-                    if (b > BLUE_THRESHOLD && b > r && b > g) {
-                        isSky = true;
-                    }
-
-                    // Bright sky detection (any color)
-                    if (b > BRIGHT_THRESHOLD && g > BRIGHT_THRESHOLD && r > BRIGHT_THRESHOLD) {
-                        isSky = true;
-                    }
-
-                    // Apply consistent transmission adjustment for sky
-                    if (isSky) {
-                        transmission.at(i, j) = std::max(transmission.at(i, j), SKY_TRANSMISSION_MIN);
-                    }
+                    transmission.at(i, j) = std::max(0.01, std::min(1.0, transmission.at(i, j)));
                 }
             }
+
+            // SKY REGION HANDLING CODE REMOVED HERE - No special treatment for sky areas
 
             // End timing for refinement
             auto refinementEndTime = std::chrono::high_resolution_clock::now();
@@ -296,47 +278,44 @@ namespace DarkChannel {
             // Create result image
             ImageF64 result(img_double.width, img_double.height, img_double.channels);
 
-            // Process all pixels in parallel
+            // Process all pixels in parallel with improved precision
 #pragma omp parallel for collapse(2)
             for (int i = 0; i < img_double.height; i++) {
                 for (int j = 0; j < img_double.width; j++) {
+                    // Apply minimum transmission threshold
                     double t = std::max(transmission.at(i, j), t0);
 
-                    // Calculate temporary storage for color values
-                    double recovered[3];
-                    double lum = 0.0;
-
-                    // Process each channel
+                    // Process channels separately to avoid interdependencies
                     for (int c = 0; c < 3; c++) {
                         double normalized = img_double.at(i, j, c);
-                        // Apply dehaze formula J = (I-A)/t + A with bounds checking
-                        recovered[c] = ((normalized - atmospheric_light[c]) / t) + atmospheric_light[c];
-
-                        // Calculate luminance for saturation correction
-                        if (c == 0) lum += LUMINANCE_B * recovered[c];      // B
-                        else if (c == 1) lum += LUMINANCE_G * recovered[c]; // G
-                        else lum += LUMINANCE_R * recovered[c];             // R
+                        // Apply dehaze formula with intermediate clamping
+                        double temp = ((normalized - atmospheric_light[c]) / t) + atmospheric_light[c];
+                        temp = std::max(0.0, std::min(1.0, temp));
+                        result.at(i, j, c) = temp;
                     }
 
-                    // Apply consistent saturation/color correction across all implementations
+                    // Calculate luminance after initial recovery
+                    double lum = LUMINANCE_B * result.at(i, j, 0) +
+                        LUMINANCE_G * result.at(i, j, 1) +
+                        LUMINANCE_R * result.at(i, j, 2);
+
+                    // Apply color correction in a separate step
                     for (int c = 0; c < 3; c++) {
-                        // Apply correction for extreme values to reduce artifacts
-                        if (recovered[c] > EXTREME_VALUE_UPPER || recovered[c] < EXTREME_VALUE_LOWER) {
-                            recovered[c] = recovered[c] * COLOR_BLEND_FACTOR + lum * (1.0 - COLOR_BLEND_FACTOR);
+                        double value = result.at(i, j, c);
+                        if (value > EXTREME_VALUE_UPPER || value < EXTREME_VALUE_LOWER) {
+                            value = value * COLOR_BLEND_FACTOR + lum * (1.0 - COLOR_BLEND_FACTOR);
                         }
 
-                        // Apply consistent brightness adjustments based on scene type
+                        // Apply gamma consistently
                         if (lum < DARK_SCENE_THRESHOLD) {
-                            // For darker scenes, slightly increase brightness
-                            recovered[c] = std::pow(recovered[c], DARK_SCENE_GAMMA);
+                            value = std::pow(value, DARK_SCENE_GAMMA);
                         }
                         else {
-                            // For brighter scenes, slightly reduce brightness
-                            recovered[c] = std::pow(recovered[c], BRIGHT_SCENE_GAMMA);
+                            value = std::pow(value, BRIGHT_SCENE_GAMMA);
                         }
 
-                        // Ensure bounds and store
-                        result.at(i, j, c) = std::max(0.0, std::min(1.0, recovered[c]));
+                        // Final clamping
+                        result.at(i, j, c) = std::max(0.0, std::min(1.0, value));
                     }
                 }
             }
